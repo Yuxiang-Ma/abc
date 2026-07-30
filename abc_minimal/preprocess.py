@@ -1,6 +1,7 @@
 """Shared state/action normalization and image preprocessing."""
 
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -69,3 +70,59 @@ def resize_pad_normalize(img_chw, target_h=224, target_w=224):
         x = x / 255.0
     x = resize_with_pad(x.permute(1, 2, 0), target_h, target_w).permute(2, 0, 1)
     return imagenet_normalize(x)
+
+
+def _rotate(img_hwc, angle_deg):
+    """Rotate (H,W,C) with reflection padding."""
+    if abs(angle_deg) < 0.1:
+        return img_hwc
+    H, W, C = img_hwc.shape
+    a = math.radians(angle_deg)
+    cos_a, sin_a = math.cos(a), math.sin(a)
+    gy, gx = torch.meshgrid(
+        torch.linspace(-1, 1, H), torch.linspace(-1, 1, W), indexing="ij"
+    )
+    grid = torch.stack([gx * cos_a - gy * sin_a, gx * sin_a + gy * cos_a], dim=-1)
+    out = F.grid_sample(
+        img_hwc.permute(2, 0, 1).unsqueeze(0),
+        grid.unsqueeze(0),
+        mode="bilinear",
+        padding_mode="reflection",
+        align_corners=False,
+    )
+    return out.squeeze(0).permute(1, 2, 0)
+
+
+def augment_and_normalize(images, train):
+    """Apply production image augmentations and ImageNet normalization."""
+    out = {}
+    for cam, img in images.items():
+        x = img.permute(1, 2, 0)
+        if train and "top" in cam:
+            angle = (torch.rand(1) * 10 - 5).item()
+            x = _rotate(x, angle)
+            H, W, _ = x.shape
+            ch, cw = int(H * 0.95), int(W * 0.95)
+            if H - ch > 0 and W - cw > 0:
+                sh = torch.randint(0, H - ch + 1, (1,)).item()
+                sw = torch.randint(0, W - cw + 1, (1,)).item()
+                x = x[sh : sh + ch, sw : sw + cw, :]
+                x = F.interpolate(
+                    x.permute(2, 0, 1).unsqueeze(0),
+                    size=(H, W),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0).permute(1, 2, 0)
+        x = resize_with_pad(x, 224, 224)
+        if train:
+            b = 0.7 + torch.rand(1).item() * 0.6
+            x = x * b
+            c = 0.6 + torch.rand(1).item() * 0.8
+            mean = x.mean()
+            x = (x - mean) * c + mean
+            s = 0.5 + torch.rand(1).item() * 1.0
+            gray = x.mean(dim=-1, keepdim=True)
+            x = gray + (x - gray) * s
+            x = torch.clamp(x, 0, 1)
+        out[cam] = imagenet_normalize(x.permute(2, 0, 1))
+    return out

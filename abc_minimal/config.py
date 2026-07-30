@@ -141,6 +141,7 @@ class TrainConfig:
     mixture: list[MixtureComponent] = field(default_factory=list)
 
     load_pretrained: bool = False
+    resume_from: str | None = None
     dino_bf16: bool = True
     compile: bool = True
 
@@ -273,6 +274,8 @@ def validate_train_config(
     required += [cache_root / p for c in components for p in (c.train_dir, c.val_dir)]
     if config.load_pretrained:
         required.append(checkpoint_path)
+    if config.resume_from:
+        required.append(Path(config.resume_from).expanduser())
     missing = [str(path) for path in required if not path.exists()]
     if missing:
         errors.append("missing required paths: " + ", ".join(missing))

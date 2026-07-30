@@ -69,6 +69,9 @@ The command to run training is below. Note that this is for single node training
 
 ```bash
 uv run torchrun --standalone --nproc-per-node 8 train.py
+
+# Resume from a local checkpoint, including optimizer/scheduler and data stream position.
+uv run torchrun --standalone --nproc-per-node 8 train.py --resume-from cache/finetune_checkpoints/last.pt
 ```
 The dataclass config is exposed as CLI flags; `uv run python train.py --help`
 shows training, optimizer, flow, CLIP asset, and model options such as
@@ -171,6 +174,28 @@ raw MCAPs after each successful split conversion. For a quick smoke test:
 ```bash
 uv run export_hf_task.py --task organize_the_condiment_bottles --split train --max-episodes 1
 ```
+
+For multi-node jobs without a shared filesystem, predownload a deterministic
+node-local shard on each node before launching training:
+
+```bash
+ABC_CACHE=/local_nvme/abc_cache HF_TOKEN=... \
+uv run prepare_hf_shards.py \
+  --tasks organize_the_condiment_bottles \
+  --num-nodes 8 --node-rank $NODE_RANK --workers 8
+
+ABC_CACHE=/local_nvme/abc_cache \
+uv run torchrun --nnodes 8 --node-rank $NODE_RANK --nproc-per-node 8 train.py
+```
+
+The predownload step writes this node's converted episodes into the usual
+`train_real/` and `val_real/` directories. Training auto-detects the
+`hf_status/shard.json` marker and uses local-rank sampling, so validation
+metrics are accumulated across different validation shards on different GPUs.
+
+The revision is pinned to a commit SHA at run time and training verifies at
+startup that all nodes sharded the same snapshot. If the dataset may change
+while nodes prepare, pass the same explicit `--revision <sha>` to every node.
 
 If you already have local MCAPs, call the lower-level converter directly:
 
