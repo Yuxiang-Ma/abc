@@ -1,7 +1,7 @@
 [project]
 name = "abc-minimal"
 version = "0.1.0"
-description = "Minimal end-to-end release for the abc dataset and the ABC-DiT (LBM) policy."
+description = "Minimal end-to-end release for the abc dataset and the ABC-DiT policy."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -21,7 +21,7 @@ dependencies = [
     # hf_prepare.py lists and downloads node-sharded ABC-130k data.
     "huggingface_hub",
     # mcap-protobuf-support already pulls in mcap, but list it explicitly
-    # so users who only run export_mcap.py see the dep up front.
+    # so users who only run scripts/export_mcap.py see the dep up front.
     "mcap",
     "mcap-protobuf-support",
     # Optional: W&B logging in train.py (off by default; --log-wandb to enable).

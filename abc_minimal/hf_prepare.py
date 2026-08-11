@@ -11,7 +11,6 @@ import hashlib
 import json
 import os
 import shutil
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -272,13 +271,7 @@ def _download_one(cfg: HfShardPrepareConfig, item: dict) -> Path:
 
 
 def _convert_jobs(jobs: list[tuple[str, str, str]], workers: int) -> list[str | None]:
-    try:
-        from export_mcap import export_episode
-    except ImportError:
-        # export_mcap lives at the repo root; make it importable when this
-        # module is used from outside a repo-root script.
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-        from export_mcap import export_episode
+    from abc_minimal.export_mcap import export_episode
 
     if not jobs:
         return []

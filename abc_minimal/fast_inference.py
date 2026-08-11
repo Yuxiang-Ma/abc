@@ -16,6 +16,7 @@ class _PolicyForFastInference(Protocol):
     config: Any
     task_vec: torch.Tensor
     norm_stats: dict[str, Any]
+    norm_preset: str
     diffusion_steps: int
 
     def normalized_action_prefix(
@@ -79,9 +80,10 @@ class FastInferenceGraph:
             self.static_noise.copy_(
                 torch.from_numpy(noise_arr).to(device=self.device, dtype=self.dtype)
             )
+        preset = self.policy.norm_preset
         for cam in m.camera_keys:
             self.static_images[cam].copy_(
-                resize_pad_normalize(obs["images"][cam])
+                resize_pad_normalize(obs["images"][cam], preset=preset)
                 .unsqueeze(0)
                 .to(device=self.device, dtype=self.dtype)
             )

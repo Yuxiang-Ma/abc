@@ -10,6 +10,7 @@ import asyncio
 import math
 import threading
 import time
+from pathlib import Path
 
 import mujoco
 import numpy as np
@@ -23,7 +24,6 @@ from abc_minimal.eval_policy import (
     SimPolicy,
     _quat_mul,
     _quat_yaw,
-    local_checkpoint,
     require_mjwarp,
     resolve_device,
     sample_bottle_pose,
@@ -39,7 +39,7 @@ def main(cfg: VizPolicyConfig) -> None:
         raise ValueError("Invalid sim eval config:\n  - " + "\n  - ".join(errors))
 
     require_mjwarp()
-    ckpt_path = local_checkpoint(cfg.sim.checkpoint)
+    ckpt_path = Path(cfg.sim.checkpoint).expanduser().resolve()
     device = resolve_device(cfg.sim.device)
     policy = SimPolicy(ckpt_path, cfg.sim, device)
     env = PutBottlesEnv(

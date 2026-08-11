@@ -1,10 +1,7 @@
-# /// script
-# requires-python = ">=3.10"
-# dependencies = ["numpy", "mcap", "mcap-protobuf-support", "tyro"]
-# ///
 """Convert release-format MCAP episodes into the training data layout.
 
-Writes state/action arrays, combined camera video, and episode metadata per episode.
+Writes state/action arrays, combined camera video, and episode metadata per
+episode. CLI entrypoint: scripts/export_mcap.py.
 """
 
 import json
@@ -31,6 +28,12 @@ TOP_TOPIC_CANDIDATES = ("/top-left-camera", "/top-right-camera", "/top-camera")
 CAMERAS = [("left", "/left-wrist-camera"), ("right", "/right-wrist-camera")]
 STATE_TOPICS = [("/left-arm-state", 6), ("/left-ee-state", 1), ("/right-arm-state", 6), ("/right-ee-state", 1)]
 ACTION_TOPICS = [("/left-arm-action", 6), ("/left-ee-action", 1), ("/right-arm-action", 6), ("/right-ee-action", 1)]
+# Subtask segments: each `/subtask-annotation` message marks the start of a
+# subtask (free text on `.data`); the segment runs until the next annotation.
+# They live either inline in episode.mcap or in a sibling annotation.mcap that
+# shares the same absolute-ns timebase.
+ANNOTATION_TOPIC = "/subtask-annotation"
+ANNOTATION_FILENAME = "annotation.mcap"
 X264 = ["-c:v", "libx264", "-preset", "fast", "-crf", "18", "-bf", "0", "-pix_fmt", "yuv420p"]
 # Strict params for the final combined.mp4 the trainer reads. Mirrors
 # production dataprocessing/image_ops.py:re_encode_mp4 so the trainer's
@@ -116,9 +119,22 @@ def export_episode(job):
     from mcap_protobuf.decoder import DecoderFactory
 
     cams, scalars = {}, {}
+    annotations = []  # (log_time_ns, label) subtask-segment starts
+    operator_id = None
+    session = {}
     with open(mcap_path, "rb") as f:
         reader = make_reader(f, decoder_factories=[DecoderFactory()])
-        session = {m.metadata["session-uuid"]: None for m in reader.iter_metadata() if m.name == "session-metadata"}
+        # Release episodes carry an "episode-metadata" record with "operator_id";
+        # the internal delivery format used "session-metadata" with "operator-id".
+        # Support both.
+        for m in reader.iter_metadata():
+            if m.name in ("episode-metadata", "session-metadata"):
+                md = dict(m.metadata)
+                operator_id = operator_id or md.get("operator_id") or md.get("operator-id")
+                if "session-uuid" in md:
+                    session[md["session-uuid"]] = None
+                elif "session_id" in md:
+                    session[md["session_id"]] = None
     with open(mcap_path, "rb") as f:
         reader = make_reader(f, decoder_factories=[DecoderFactory()])
         scalar_names = {t for t, _ in STATE_TOPICS + ACTION_TOPICS}
@@ -129,10 +145,22 @@ def export_episode(job):
             elif channel.topic in scalar_names:
                 scalars.setdefault(channel.topic, []).append(
                     (message.log_time, np.array(decoded.position, dtype=np.float64)))
+            elif channel.topic == ANNOTATION_TOPIC:
+                annotations.append((message.log_time, decoded.data))
     for msgs in (*cams.values(), *scalars.values()):
         msgs.sort(key=lambda x: x[0])
 
     ep_id = f"episode_{next(iter(session))}" if session else Path(mcap_path).parent.name
+
+    # Subtasks may live in a sibling annotation.mcap rather than inline.
+    if not annotations:
+        annotation_path = Path(mcap_path).with_name(ANNOTATION_FILENAME)
+        if annotation_path != Path(mcap_path) and annotation_path.exists():
+            with open(annotation_path, "rb") as f:
+                ann_reader = make_reader(f, decoder_factories=[DecoderFactory()])
+                for _, channel, message, decoded in ann_reader.iter_decoded_messages():
+                    if channel.topic == ANNOTATION_TOPIC:
+                        annotations.append((message.log_time, decoded.data))
     # Resolve the top stream. Stereo episodes: deterministic per-episode pick
     # of one eye (matches production stereo_top_policy="random"). Mono
     # episodes: fall back to the single `/top-camera` stream.
@@ -213,9 +241,56 @@ def export_episode(job):
             "camera_resolutions": {k: [OUT_W, OUT_H] for k, _ in active_cams},
             "alignment": "fixed_clock_30hz_causal", "t0_ns": int(t0), "tick_ns": TICK_NS,
             "num_steps": num_steps}
+    # operator_id is optional conditioning/filtering signal (see the dataloader's
+    # operator prompting); persist it in the metadata when the MCAP carried one.
+    if operator_id:
+        meta["operator_id"] = operator_id
     (out_dir / "episode_metadata.json").write_text(json.dumps(meta, indent=2))
-    print(f"[OK] {ep_id}: {num_steps} steps, cams={[k for k, _ in active_cams]}")
+
+    # Sidecars for policy conditioning (both optional; absent => task-prompt only):
+    #   subtasks.json  {"<frame_idx>": "<label>"}  — the per-frame subtask label,
+    #     the exact schema the dataloader's build_prompt() reads. Each annotation
+    #     starts a segment that runs until the next one (or episode end).
+    #   operator.json  {"operator_id": "<uuid>"}   — convenience mirror of the id
+    #     also stored in episode_metadata.json.
+    n_annotated = 0
+    if annotations:
+        frame_labels = _frames_to_subtasks(annotations, ticks)
+        n_annotated = len(frame_labels)
+        (out_dir / "subtasks.json").write_text(json.dumps(frame_labels))
+    if operator_id:
+        (out_dir / "operator.json").write_text(json.dumps({"operator_id": operator_id}))
+
+    extra = []
+    if operator_id:
+        extra.append(f"operator={operator_id[:8]}")
+    if n_annotated:
+        extra.append(f"subtask-frames={n_annotated}")
+    print(f"[OK] {ep_id}: {num_steps} steps, cams={[k for k, _ in active_cams]}"
+          + (f", {', '.join(extra)}" if extra else ""))
     return ep_id
+
+
+def _frames_to_subtasks(annotations, ticks):
+    """Map (log_time_ns, label) segment-starts to a {frame_idx: label} dict.
+
+    Each annotation marks the start of a subtask segment that runs until the
+    next annotation; every frame whose tick falls in a segment gets that
+    segment's label. Frames before the first annotation are left unlabeled.
+    """
+    anns = sorted(annotations, key=lambda x: x[0])
+    ann_ts = np.array([t for t, _ in anns], dtype=np.int64)
+    # For each frame tick, the active segment is the latest annotation at or
+    # before it; searchsorted(side="right") - 1 gives that segment index (-1 =
+    # before the first annotation, left unlabeled).
+    seg = np.searchsorted(ann_ts, ticks, side="right") - 1
+    out = {}
+    for frame_idx, s in enumerate(seg):
+        if s >= 0:
+            label = anns[int(s)][1]
+            if label:
+                out[str(frame_idx)] = label
+    return out
 
 
 def main(config: ExportMcapConfig):

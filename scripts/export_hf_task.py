@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 import sys
 import time
 import urllib.error
@@ -18,6 +17,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import tyro
 
@@ -28,7 +29,7 @@ CACHE, UA = Path(os.environ.get("ABC_CACHE", "/tmp/abc_minimal_cache")), "abc-mi
 
 @dataclass
 class Config:
-    """Download all MCAPs for one HF task, then run export_mcap.py."""
+    """Download all MCAPs for one HF task, then convert via abc_minimal.export_mcap."""
 
     task: Annotated[str, tyro.conf.arg(help="HF task folder, e.g. organize_the_condiment_bottles.")]
     split: Annotated[Literal["train", "val", "all"], tyro.conf.arg(help="Split to download.")] = "all"
@@ -39,7 +40,7 @@ class Config:
         tyro.conf.arg(help="HF token; otherwise use HF_TOKEN or HUGGING_FACE_HUB_TOKEN."),
     ] = None
     cache: Annotated[Path, tyro.conf.arg(help="Cache root.")] = CACHE
-    workers: Annotated[int, tyro.conf.arg(help="Workers passed to export_mcap.py.")] = 4
+    workers: Annotated[int, tyro.conf.arg(help="Conversion worker processes.")] = 4
     max_episodes: Annotated[int | None, tyro.conf.arg(help="Optional per-split cap for smoke tests.")] = None
     dry_run: Annotated[bool, tyro.conf.arg(help="List only; do not download or convert.")] = False
     keep_mcaps: Annotated[bool, tyro.conf.arg(help="Keep staged raw MCAPs after conversion.")] = False
@@ -166,9 +167,11 @@ def write_manifest(cfg: Config, split: str, files: list[dict], root: Path) -> No
 
 
 def convert(cfg: Config, split: str, root: Path) -> None:
-    cmd = [sys.executable, "export_mcap.py", str(root), str((cfg.cache / f"{split}_real").expanduser()), str(cfg.workers)]
-    print("[convert]", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    from abc_minimal.export_mcap import ExportMcapConfig, main as export_mcap_main
+
+    out_dir = (cfg.cache / f"{split}_real").expanduser()
+    print(f"[convert] export_mcap {root} -> {out_dir} ({cfg.workers} workers)")
+    export_mcap_main(ExportMcapConfig(root=root, out_dir=out_dir, workers=cfg.workers))
 
 
 def run_split(cfg: Config, split: str, tok: str | None) -> None:

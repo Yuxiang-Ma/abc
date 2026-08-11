@@ -9,8 +9,23 @@ import torch
 import torch.nn.functional as F
 
 
-IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+# Image normalization stats, keyed by preset: DINOv3 uses ImageNet stats,
+# CLIP its own. (mean, std) as (3, 1, 1) tensors.
+NORM_PRESETS = {
+    "imagenet": (
+        torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1),
+        torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1),
+    ),
+    "clip": (
+        torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(3, 1, 1),
+        torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(3, 1, 1),
+    ),
+}
+
+
+def preset_for_backbone(vision_backbone):
+    """Map a vision backbone name to its normalization preset."""
+    return "clip" if vision_backbone == "clip" else "imagenet"
 
 
 def parse_norm_stats(raw):
@@ -58,18 +73,20 @@ def resize_with_pad(img_hwc, target_h=224, target_w=224):
     return padded.permute(1, 2, 0)
 
 
-def imagenet_normalize(img_chw):
-    mean = IMAGENET_MEAN.to(device=img_chw.device, dtype=img_chw.dtype)
-    std = IMAGENET_STD.to(device=img_chw.device, dtype=img_chw.dtype)
+def normalize_image(img_chw, preset="imagenet"):
+    """Normalize a CHW image with the given preset ("imagenet" or "clip")."""
+    mean, std = NORM_PRESETS[preset]
+    mean = mean.to(device=img_chw.device, dtype=img_chw.dtype)
+    std = std.to(device=img_chw.device, dtype=img_chw.dtype)
     return (img_chw - mean) / (std + 1e-6)
 
 
-def resize_pad_normalize(img_chw, target_h=224, target_w=224):
+def resize_pad_normalize(img_chw, target_h=224, target_w=224, preset="imagenet"):
     x = torch.as_tensor(img_chw).float()
     if x.max() > 1.0:
         x = x / 255.0
     x = resize_with_pad(x.permute(1, 2, 0), target_h, target_w).permute(2, 0, 1)
-    return imagenet_normalize(x)
+    return normalize_image(x, preset=preset)
 
 
 def _rotate(img_hwc, angle_deg):
@@ -93,8 +110,8 @@ def _rotate(img_hwc, angle_deg):
     return out.squeeze(0).permute(1, 2, 0)
 
 
-def augment_and_normalize(images, train):
-    """Apply production image augmentations and ImageNet normalization."""
+def augment_and_normalize(images, train, norm_preset="imagenet"):
+    """Apply production image augmentations and backbone-specific normalization."""
     out = {}
     for cam, img in images.items():
         x = img.permute(1, 2, 0)
@@ -124,5 +141,5 @@ def augment_and_normalize(images, train):
             gray = x.mean(dim=-1, keepdim=True)
             x = gray + (x - gray) * s
             x = torch.clamp(x, 0, 1)
-        out[cam] = imagenet_normalize(x.permute(2, 0, 1))
+        out[cam] = normalize_image(x.permute(2, 0, 1), preset=norm_preset)
     return out

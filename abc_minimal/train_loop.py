@@ -32,10 +32,12 @@ from abc_minimal.dataloader import (
 from abc_minimal.dit import (
     CLIPTextEmbedder,
     DiTPolicy,
+    load_clip_vision_weights,
     load_pretrained,
     task_name_to_prompt,
 )
-from abc_minimal.preprocess import load_norm_stats
+from abc_minimal.operator import load_operator_label_maps
+from abc_minimal.preprocess import load_norm_stats, parse_norm_stats
 
 # Enable TF32-backed fp32 matmul on NVIDIA GPUs.
 torch.set_float32_matmul_precision("high")
@@ -56,7 +58,7 @@ def batch_to_device(batch, device, embedder):
 
 def main(config: TrainConfig):
     cache_root = Path(config.cache_root)
-    checkpoint_path = cache_root / "abc_dit_xl_200k_model.pt"
+    checkpoint_path = cache_root / config.pretrained_ckpt_name
     output_dir = cache_root / "finetune_checkpoints"
     components = validate_train_config(config, cache_root, checkpoint_path)
 
@@ -84,15 +86,34 @@ def main(config: TrainConfig):
     torch.manual_seed(config.seed + rank)
     np.random.seed(config.seed + rank)
 
+    backbone = config.model.vision_backbone
     model = DiTPolicy(config.model)
+    ckpt_norm_stats = None
     if resume_ckpt is not None:
-        # Resume an existing model run
+        # Resume an existing model run. Resume checkpoints embed the run's
+        # norm_stats, so inherit_ckpt_norm_stats works without norm_stats.json.
         model.load_state_dict(resume_ckpt["model"])
+        ckpt_norm_stats = resume_ckpt.get("norm_stats")
         if rank == 0:
             print(f"resuming from {config.resume_from} at step {resume_step}")
     elif config.load_pretrained:
         # New run fine-tuning the released policy. Fresh optimizer at step 0.
-        load_pretrained(model, checkpoint_path)
+        ckpt = load_pretrained(model, checkpoint_path)
+        ckpt_norm_stats = ckpt.get("norm_stats") if isinstance(ckpt, dict) else None
+        if rank == 0:
+            print(f"loaded pretrained checkpoint {checkpoint_path}")
+    elif backbone == "clip":
+        # Rank-0-first so a single rank downloads the ViT-B/16 checkpoint; the
+        # others then load it from the local cache (same pattern as the text
+        # assets below).
+        if distributed and rank != 0:
+            dist.barrier()
+        missing, unexpected = load_clip_vision_weights(model.img_backbone, config.clip)
+        if distributed and rank == 0:
+            dist.barrier()
+        if rank == 0:
+            print(f"loaded CLIP ViT-B/16 vision weights "
+                  f"(missing={len(missing)} unexpected={len(unexpected)})")
     else:
         # New run from scratch: only the vision tower starts from pretrained (DINOv3) weights.
         dinov3_ckpt = cache_root / "dinov3_vitb16_pretrain_lvd1689m.pth"
@@ -109,7 +130,7 @@ def main(config: TrainConfig):
     if config.dino_bf16:
         model.img_backbone.set_bfloat16(True)
         if rank == 0:
-            print("DINOv3 bf16 autocast enabled")
+            print(f"{backbone} vision bf16 autocast enabled")
 
     model = model.to(device)
 
@@ -155,17 +176,44 @@ def main(config: TrainConfig):
     if hasattr(module, "_orig_mod"):
         module = module._orig_mod
 
-    norm_stats = load_norm_stats(cache_root / "norm_stats.json")
+    if config.inherit_ckpt_norm_stats and ckpt_norm_stats is not None:
+        norm_stats = parse_norm_stats(ckpt_norm_stats)
+        if rank == 0:
+            print("using norm_stats embedded in the pretrained checkpoint")
+    else:
+        stats_path = cache_root / "norm_stats.json"
+        if not stats_path.exists():
+            raise FileNotFoundError(
+                f"{stats_path} not found and the loaded checkpoint embeds no "
+                "norm_stats; provide norm_stats.json or finetune from a "
+                "checkpoint that embeds its stats."
+            )
+        norm_stats = load_norm_stats(stats_path)
     if distributed and rank != 0:
         dist.barrier()
     embedder = CLIPTextEmbedder(config.clip, device="cpu")
     if distributed and rank == 0:
         dist.barrier()
 
+    # Operator prompting needs a label-map manifest built a priori with
+    # scripts/build_operator_label_map.py (validate_train_config enforces the path).
+    operator_label_maps = {}
+    if config.prompt.use_operator_id_as_prompt:
+        operator_label_maps = load_operator_label_maps(config.prompt.operator_label_map_path)
+        if rank == 0:
+            if operator_label_maps:
+                print(f"[operator] label maps for {len(operator_label_maps)} tasks "
+                      f"({config.prompt.operator_label_map_path})")
+            else:
+                print("\033[93m[operator] WARNING: operator prompting is enabled but "
+                      f"{config.prompt.operator_label_map_path} contains no label maps; "
+                      "training continues without operator conditioning\033[0m")
     train_loader, train_components = build_train_loader(
-        config, components, norm_stats, data_scope, resume_step
+        config, components, norm_stats, data_scope, resume_step, operator_label_maps
     )
-    val_loaders, val_components = build_val_loaders(config, components, norm_stats, data_scope)
+    val_loaders, val_components = build_val_loaders(
+        config, components, norm_stats, data_scope, operator_label_maps
+    )
 
     wandb = None
     if config.log_wandb and rank == 0:
@@ -231,22 +279,35 @@ def main(config: TrainConfig):
         if global_step % config.val_every == 0:
             model.eval()
             per_component_recon = {}
+            per_component_loss = {}
             skipped_val = []
             for name, vl in val_loaders.items():
-                err_sum, elem_count = 0.0, 0
+                err_sum, elem_count, loss_sum, batch_count = 0.0, 0, 0.0, 0
                 for vb in vl:
                     vb = batch_to_device(vb, device, embedder)
                     with torch.no_grad():
+                        # val_recon_error: pure-generation MSE over the full chunk
+                        # (matches the reference reconstruction_error on infer()).
                         pred = module.sample_actions(vb, num_steps=config.flow.num_diffusion_steps)
                         err_sum += F.mse_loss(
                             pred, vb["actions"], reduction="sum"
                         ).item()
                         elem_count += vb["actions"].numel()
-                stats = torch.tensor([err_sum, float(elem_count)], device=device)
+                        # val_loss: the training diffusion loss on val data with no
+                        # action prefix (matches the reference val_loss: forward with
+                        # max_action_prefix=0, prefix_conditioning_prob=0.0).
+                        loss_sum += module(
+                            vb, max_action_prefix=0, prefix_conditioning_prob=0.0
+                        ).item()
+                        batch_count += 1
+                stats = torch.tensor(
+                    [err_sum, float(elem_count), loss_sum, float(batch_count)], device=device
+                )
                 if distributed:
                     dist.all_reduce(stats, op=dist.ReduceOp.SUM)
                 if stats[1].item() > 0:
                     per_component_recon[name] = (stats[0] / stats[1]).item()
+                    per_component_loss[name] = (stats[2] / stats[3]).item()
                 else:
                     skipped_val.append(name)
             model.train()
@@ -254,10 +315,13 @@ def main(config: TrainConfig):
                 if per_component_recon:
                     parts = "  ".join(f"{n}={v:.4f}" for n, v in per_component_recon.items())
                     avg = sum(per_component_recon.values()) / len(per_component_recon)
-                    print(f"step {global_step:6d}  val_recon_error {avg:.4f}  ({parts})")
+                    avg_loss = sum(per_component_loss.values()) / len(per_component_loss)
+                    print(f"step {global_step:6d}  val_recon_error {avg:.4f}  "
+                          f"val_loss {avg_loss:.4f}  ({parts})")
                     if wandb:
-                        log = {"val_recon_error": avg}
+                        log = {"val_recon_error": avg, "val_loss": avg_loss}
                         log.update({f"val_recon_error/{n}": v for n, v in per_component_recon.items()})
+                        log.update({f"val_loss/{n}": v for n, v in per_component_loss.items()})
                         wandb.log(log, step=global_step)
                 else:
                     print(f"step {global_step:6d}  val skipped (no full validation batches)")

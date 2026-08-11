@@ -96,6 +96,19 @@ VRAM you may need to reduce `--batch-size`.
 The above training yields ~2.6-3 iterations / sec on H100/H200. It achieves a training
 loss of ~`0.048` after 75k steps.
 
+The DiT policy also supports a CLIP ViT-B/16 vision backbone (in place of DINOv3)
+via `--model.vision-backbone clip`, which selects the CLIP visual tower and CLIP
+image normalization. This is the configuration you finetune from when adapting a
+CLIP-DiT checkpoint to a new task such as t-shirt folding.
+
+To finetune from a released checkpoint instead of training from scratch, pass
+`--load-pretrained` (fresh optimizer, step 0); `--pretrained-ckpt-name` picks
+the checkpoint file inside the cache dir (default `abc_dit_xl_200k_model.pt`).
+Normalization stats embedded in the checkpoint are inherited by default, so no
+standalone `norm_stats.json` is needed (`--no-inherit-ckpt-norm-stats` forces
+`cache/norm_stats.json` instead). Combine with `--model.vision-backbone clip`
+when the parent is a CLIP-DiT checkpoint.
+
 ## Evaluation
 
 You can either evaluate a checkpoint you trained yourself (drops into
@@ -139,7 +152,7 @@ Useful flags:
 `--execute-chunk-dim` actions (defaults: 120 chunks × 15 = 1800 sim steps).
 - `--diffusion-steps N` — flow-matching Euler steps per inference
 (default 10, matches production).
-- `--checkpoint` — accepts a local `.pt` path or `s3://…/<file>.pt`.
+- `--checkpoint` — path to the `.pt` checkpoint to evaluate.
 - `--norm-stats-path` — explicit `norm_stats.json` (otherwise uses the
 one bundled in the checkpoint).
 - `--fast-inference` / `--no-fast-inference` (default on) — bf16 +
@@ -163,16 +176,16 @@ downloading.
 Download all MCAPs for one task and convert them in place:
 
 ```bash
-uv run export_hf_task.py --task organize_the_condiment_bottles
+uv run scripts/export_hf_task.py --task organize_the_condiment_bottles
 ```
 
 By default this downloads both `train` and `val`, stages raw MCAPs under
-`$ABC_CACHE/hf_tasks/<task>/`, runs `export_mcap.py`, writes converted episodes
+`$ABC_CACHE/hf_tasks/<task>/`, runs the MCAP converter, writes converted episodes
 to `$ABC_CACHE/train_real/` and `$ABC_CACHE/val_real/`, then deletes the staged
 raw MCAPs after each successful split conversion. For a quick smoke test:
 
 ```bash
-uv run export_hf_task.py --task organize_the_condiment_bottles --split train --max-episodes 1
+uv run scripts/export_hf_task.py --task organize_the_condiment_bottles --split train --max-episodes 1
 ```
 
 For multi-node jobs without a shared filesystem, predownload a deterministic
@@ -180,7 +193,7 @@ node-local shard on each node before launching training:
 
 ```bash
 ABC_CACHE=/local_nvme/abc_cache HF_TOKEN=... \
-uv run prepare_hf_shards.py \
+uv run scripts/prepare_hf_shards.py \
   --tasks organize_the_condiment_bottles \
   --num-nodes 8 --node-rank $NODE_RANK --workers 8
 
@@ -200,7 +213,7 @@ while nodes prepare, pass the same explicit `--revision <sha>` to every node.
 If you already have local MCAPs, call the lower-level converter directly:
 
 ```bash
-uv run export_mcap.py ./train_run_1 ./out
+uv run scripts/export_mcap.py ./train_run_1 ./out
 ```
 
 The input is expected to look like:
@@ -215,7 +228,7 @@ train_run_1/
 You can also pass the number of worker processes:
 
 ```bash
-uv run export_mcap.py ./train_run_1 ./out 8
+uv run scripts/export_mcap.py ./train_run_1 ./out 8
 ```
 
 Each output episode is written to `./out/episode_<uuid>/` in the same format
@@ -229,6 +242,57 @@ episode_<uuid>/
 ```
 
 The mp4 is encoded in a manner that allows for efficient dataloading. For details, see the ABC paper.
+
+### Subtask & operator conditioning
+
+In addition to the task prompt, our policies can condition  **subtask** labels and on
+the episode's **operator** id. The MCAP converter (`scripts/export_mcap.py`)
+extracts both from the release MCAPs when present and writes two optional
+extra files next to the episode:
+
+```text
+episode_<uuid>/
+  subtasks.json      # {"<frame_idx>": "<subtask label>", ...}  — per-frame subtask
+  operator.json      # {"operator_id": "<uuid>"}                — the teleoperator id
+```
+
+- **Subtasks** Enable at train time with `--prompt.use-subtask-as-prompt`,
+  choosing `--prompt.subtask-mode {replace,append}` (`replace` swaps the task prompt for the subtask label;
+  `append` formats both via `--prompt.subtask-append-format`).
+- **Operators** We map UUIDs to short deterministic labels (`operator 0`, … or names). The labels are computed
+per-task such that operators with more hours (proxy for quality) have lower numbers.
+Enable with `--prompt.use-operator-id-as-prompt` and choose `--prompt.operator-prompting-mode {text_indexed,text_name}`; the label is appended as `"{prompt}. {operator}"`.
+
+  The per-task map must be built prior to training and passed via
+  `--prompt.operator-label-map-path`. Build it with:
+
+  ```bash
+  ABC_CACHE=cache/tshirt uv run scripts/build_operator_label_map.py \
+      --out cache/tshirt/operator_label_map.json
+  ```
+
+  then pass `--prompt.operator-label-map-path cache/tshirt/operator_label_map.json`.
+
+  On a node-sharded multi-node cache no single machine holds every episode, and
+  a map built from one shard would mis-rank operators and miss those on other
+  nodes. Instead, build one manifest per node from its local shard, gather the
+  shard manifests on one machine, and fold them into a global ranking —
+  hours and episode counts sum exactly across shards, so the result matches a
+  full single-machine scan:
+
+  ```bash
+  uv run scripts/build_operator_label_map.py --out shard_$NODE.json   # on each node
+  uv run scripts/build_operator_label_map.py \
+      --combine shard_0.json shard_1.json ... --out operator_label_map.json
+  ```
+
+  then copy the combined manifest to every node at the same path and pass it
+  via `--prompt.operator-label-map-path`.
+
+Both are off by default. Some episodes do not have eg. subtask annotations and 
+for these training will drop back to task prompt only.
+
+(We intend to release the global manifest in future but this is TODO.)
 
 ## Licenses
 

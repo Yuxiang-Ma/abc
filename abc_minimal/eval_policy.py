@@ -9,8 +9,6 @@ import concurrent.futures
 import json
 import math
 import re
-import subprocess
-import tempfile
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
@@ -28,7 +26,13 @@ from abc_minimal.dit import (
     load_pretrained,
 )
 from abc_minimal.fast_inference import FastInferenceGraph, FastRTCInferenceGraph
-from abc_minimal.preprocess import normalize, parse_norm_stats, resize_pad_normalize, unnormalize
+from abc_minimal.preprocess import (
+    normalize,
+    parse_norm_stats,
+    preset_for_backbone,
+    resize_pad_normalize,
+    unnormalize,
+)
 
 torch.set_float32_matmul_precision("high")
 
@@ -498,28 +502,9 @@ class PutBottlesEnv:
 # Policy adapter.
 
 
-def load_json_or_s3(path: str) -> dict[str, Any]:
-    if path.startswith("s3://"):
-        with tempfile.NamedTemporaryFile(suffix=".json") as tmp:
-            subprocess.run(["aws", "s3", "cp", path, tmp.name], check=True)
-            return json.loads(Path(tmp.name).read_text())
-    return json.loads(Path(path).expanduser().read_text())
-
-
-def local_checkpoint(path: str) -> Path:
-    if not path.startswith("s3://"):
-        return Path(path).expanduser().resolve()
-    out_dir = ROOT / "checkpoints" / "downloads"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / Path(path).name
-    if not out.exists():
-        subprocess.run(["aws", "s3", "cp", path, str(out)], check=True)
-    return out
-
-
 def resolve_norm_stats(ckpt: dict[str, Any], override: str | None) -> dict[str, Any]:
     if override:
-        raw = load_json_or_s3(override)
+        raw = json.loads(Path(override).expanduser().read_text())
     elif ckpt.get("norm_stats") is not None:
         raw = ckpt["norm_stats"]
     else:
@@ -598,6 +583,7 @@ class SimPolicy:
         self.model = DiTPolicy(config.model).to(self.device)
         ckpt = load_pretrained(self.model, checkpoint)
         self.model.eval()
+        self.norm_preset = preset_for_backbone(config.model.vision_backbone)
         self.norm_stats = resolve_norm_stats(ckpt, config.norm_stats_path)
         self.embedder = CLIPTextEmbedder(config.clip, device=self.device)
         self.task_vec = self.embedder.encode([config.prompt]).to(self.device)
@@ -709,7 +695,8 @@ class SimPolicy:
                 1, self.config.model.chunk_length, self.config.model.action_dim, device=self.device
             ),
             "images": {
-                cam: resize_pad_normalize(obs["images"][cam]).unsqueeze(0).to(self.device)
+                cam: resize_pad_normalize(obs["images"][cam], preset=self.norm_preset)
+                .unsqueeze(0).to(self.device)
                 for cam in self.config.model.camera_keys
             },
             "task_vec_clip": self.task_vec,
@@ -790,7 +777,7 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
         raise ValueError("Invalid sim eval config:\n  - " + "\n  - ".join(config_errors))
 
     require_mjwarp()
-    ckpt_path = local_checkpoint(config.checkpoint)
+    ckpt_path = Path(config.checkpoint).expanduser().resolve()
     device = resolve_device(config.device)
     policy = SimPolicy(ckpt_path, config, device)
     env = PutBottlesEnv(

@@ -1,8 +1,4 @@
-"""Everything between episodes on disk and training batches.
-
-Sections, in order: data-parallel placement (which ranks read which data),
-the on-disk episode format, map-style datasets with the step-keyed sampler,
-and the DataLoader builders used by train_loop.
+"""The dataloader for ABC.
 """
 
 import json
@@ -15,9 +11,10 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset, Sampler
 
-from abc_minimal.config import DiTConfig
+from abc_minimal.config import DiTConfig, PromptConfig
 from abc_minimal.dit import task_name_to_prompt
-from abc_minimal.preprocess import augment_and_normalize, normalize
+from abc_minimal.operator import operator_label_for
+from abc_minimal.preprocess import augment_and_normalize, normalize, preset_for_backbone
 
 
 # --- data-parallel placement ---------------------------------------------------
@@ -156,6 +153,8 @@ class EpisodeDataset(Dataset):
         default_task_name,
         mask_state_ratio,
         model_config: DiTConfig,
+        prompt_config: PromptConfig | None = None,
+        operator_label_maps=None,
     ):
         self.episodes = scan_episodes(data_dir, default_task_name, model_config)
         if not self.episodes:
@@ -165,6 +164,14 @@ class EpisodeDataset(Dataset):
         self.norm_stats = norm_stats
         self.train = train
         self.mask_state_ratio = mask_state_ratio
+        self.norm_preset = preset_for_backbone(model_config.vision_backbone)
+        # Prompt composition rules; dropouts only apply when train=True.
+        self.prompt_config = prompt_config or PromptConfig()
+        # {task_name: {operator_uuid: rank}} — empty dict = no operator conditioning.
+        self.operator_label_maps = operator_label_maps or {}
+        # Per-episode sidecar caches, filled lazily as episodes are first sampled.
+        self._subtask_cache = {}
+        self._operator_cache = {}
         self.cum = np.cumsum([usable for _, _, usable, _, _ in self.episodes])
 
     def __len__(self):
@@ -192,22 +199,77 @@ class EpisodeDataset(Dataset):
             state = np.zeros_like(state)
 
         images = augment_and_normalize(
-            decode_frame(ep_dir, k, length, source_cameras, self.camera_keys), self.train
+            decode_frame(ep_dir, k, length, source_cameras, self.camera_keys),
+            self.train,
+            norm_preset=self.norm_preset,
         )
+        prompt = self.build_prompt(ep_dir, k, task_name)
         return {
             "state": torch.from_numpy(state),
             "actions": torch.from_numpy(actions),
             "images": images,
             "state_is_masked": state_is_masked,
-            "prompt": task_name_to_prompt(task_name),
+            "prompt": prompt,
         }
+
+    def build_prompt(self, ep_dir, frame_idx, task_name):
+        """Compose the text prompt from the task name plus optional subtask
+        and operator labels.
+        """
+        base = task_name_to_prompt(task_name)
+        prompt = self._apply_subtask(base, ep_dir, frame_idx)
+        prompt = self._apply_operator(prompt, ep_dir, task_name)
+        return prompt
+
+    def _apply_subtask(self, base, ep_dir, frame_idx):
+        if not self.prompt_config.use_subtask_as_prompt:
+            return base
+        subtask = self._subtask_label(ep_dir, frame_idx)
+        if not subtask:
+            return base
+        if self.train and torch.rand(1).item() < self.prompt_config.subtask_dropout_prob:
+            return base
+        if self.prompt_config.subtask_mode == "append":
+            return self.prompt_config.subtask_append_format.format(prompt=base, subtask=subtask)
+        return task_name_to_prompt(subtask)  # "replace" (default)
+
+    def _apply_operator(self, prompt, ep_dir, task_name):
+        if not self.prompt_config.use_operator_id_as_prompt or not self.operator_label_maps:
+            return prompt
+        label = operator_label_for(
+            task_name, self._operator_id(ep_dir), self.operator_label_maps,
+            mode=self.prompt_config.operator_prompting_mode,
+        )
+        if not label:
+            return prompt
+        if self.train and torch.rand(1).item() < self.prompt_config.operator_dropout_prob:
+            return prompt
+        return self.prompt_config.operator_append_format.format(prompt=prompt, operator=label)
+
+    def _subtask_label(self, ep_dir, frame_idx):
+        if ep_dir not in self._subtask_cache:
+            path = ep_dir / "subtasks.json"
+            self._subtask_cache[ep_dir] = json.loads(path.read_text()) if path.exists() else {}
+        return self._subtask_cache[ep_dir].get(str(frame_idx), "")
+
+    def _operator_id(self, ep_dir):
+        """Per-episode operator id from operator.json, falling back to
+        episode_metadata.json. Cached; empty string when neither carries one."""
+        if ep_dir not in self._operator_cache:
+            op = ""
+            op_path = ep_dir / "operator.json"
+            if op_path.exists():
+                op = json.loads(op_path.read_text()).get("operator_id", "")
+            if not op:
+                meta_path = ep_dir / "episode_metadata.json"
+                if meta_path.exists():
+                    op = json.loads(meta_path.read_text()).get("operator_id", "")
+            self._operator_cache[ep_dir] = op or ""
+        return self._operator_cache[ep_dir]
 
 class MixtureDataset(Dataset):
     """Train-time mixture: each draw picks a component by `weights`, then a
     uniform usable-frame sample within that component.
-
-    Draws are keyed by (seed, index): different seeds give different data
-    streams, while a fixed seed keeps the stream deterministic for resume.
     """
 
     def __init__(self, components, weights, length, seed=0):
@@ -254,7 +316,8 @@ def collate(samples, camera_keys):
 
 # --- loader construction -------------------------------------------------------
 
-def build_train_loader(config, components, norm_stats, data_scope, resume_step):
+def build_train_loader(config, components, norm_stats, data_scope, resume_step,
+                       operator_label_maps):
     """Build the train mixture and its step-keyed loader.
 
     Returns the loader plus the per-component datasets for logging."""
@@ -262,7 +325,9 @@ def build_train_loader(config, components, norm_stats, data_scope, resume_step):
         EpisodeDataset(Path(config.cache_root) / c.train_dir, norm_stats, train=True,
                        default_task_name=c.task_name,
                        mask_state_ratio=config.flow.mask_state_ratio,
-                       model_config=config.model)
+                       model_config=config.model,
+                       prompt_config=config.prompt,
+                       operator_label_maps=operator_label_maps)
         for c in components
     ]
     component_weights = [c.weight for c in components]
@@ -290,7 +355,7 @@ def build_train_loader(config, components, norm_stats, data_scope, resume_step):
     )
     return train_loader, train_components
 
-def build_val_loaders(config, components, norm_stats, data_scope):
+def build_val_loaders(config, components, norm_stats, data_scope, operator_label_maps):
     """Build per-component val loaders striding this rank's slice.
 
     Returns the loaders plus (name, dataset) pairs for logging."""
@@ -299,7 +364,9 @@ def build_val_loaders(config, components, norm_stats, data_scope):
                                    train=False,
                                    default_task_name=c.task_name,
                                    mask_state_ratio=config.flow.mask_state_ratio,
-                                   model_config=config.model))
+                                   model_config=config.model,
+                                   prompt_config=config.prompt,
+                                   operator_label_maps=operator_label_maps))
         for c in components
     ]
     val_loaders = {}

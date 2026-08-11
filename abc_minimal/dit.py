@@ -6,6 +6,7 @@ Includes the CLIP text encoder and DINOv3 vision backbone needed to run the mode
 import gzip
 import html
 import math
+import os
 import urllib.request
 from functools import lru_cache
 from pathlib import Path
@@ -16,6 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from abc_minimal.config import ClipConfig, DiTConfig
+from abc_minimal.preprocess import NORM_PRESETS, preset_for_backbone
 
 # CLIP ViT-B/32 text encoder.
 
@@ -208,8 +210,7 @@ class CLIPTextTower(nn.Module):
 
 
 class CLIPTextEmbedder:
-    """OpenAI CLIP ViT-B/32 text encoder that returns normalized 512-d vectors.
-    Holds a CPU memo cache keyed by prompt so repeats skip BPE+transformer."""
+    """OpenAI CLIP ViT-B/32 text encoder that returns normalized 512-d vectors. """
 
     def __init__(self, config: ClipConfig, device="cpu"):
         b32_path, bpe_path = ensure_clip_text_assets(config)
@@ -281,6 +282,119 @@ def encode_clip_task_name(task_names, config: ClipConfig, device="cpu"):
     return encode_clip_text([task_name_to_prompt(t) for t in task_names], config, device=device)
 
 
+# CLIP ViT-B/16 vision encoder.
+
+# Dim of the pooled CLIP image embedding (the visual tower's projection output).
+CLIP_VISION_OUTPUT_DIM = 512
+
+
+class CLIPResidualAttentionBlock(nn.Module):
+    """One pre-norm transformer block of the CLIP visual tower (QuickGELU MLP)."""
+
+    def __init__(self, width, heads):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(width, heads)
+        self.ln_1 = nn.LayerNorm(width)
+        self.mlp = nn.Sequential()
+        self.mlp.add_module("c_fc", nn.Linear(width, width * 4))
+        self.mlp.add_module("gelu", CLIPQuickGELU())
+        self.mlp.add_module("c_proj", nn.Linear(width * 4, width))
+        self.ln_2 = nn.LayerNorm(width)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x), self.ln_1(x), self.ln_1(x), need_weights=False)[0]
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+
+class CLIPVisualTower(nn.Module):
+    """OpenAI CLIP ViT-B/16 visual tower."""
+
+    def __init__(self, input_resolution=224, patch_size=16, width=768, layers=12, heads=12,
+                 output_dim=CLIP_VISION_OUTPUT_DIM):
+        super().__init__()
+        self.input_resolution = input_resolution
+        self.output_dim = output_dim
+        self.conv1 = nn.Conv2d(3, width, kernel_size=patch_size, stride=patch_size, bias=False)
+        scale = width ** -0.5
+        num_patches = (input_resolution // patch_size) ** 2
+        self.class_embedding = nn.Parameter(scale * torch.randn(width))
+        self.positional_embedding = nn.Parameter(scale * torch.randn(num_patches + 1, width))
+        self.ln_pre = nn.LayerNorm(width)
+        self.transformer = nn.Module()
+        self.transformer.resblocks = nn.Sequential(
+            *[CLIPResidualAttentionBlock(width, heads) for _ in range(layers)]
+        )
+        self.ln_post = nn.LayerNorm(width)
+        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+
+    def encode_image_tokens(self, images):
+        """returns (B, 1+196, width=768) = CLS + patch tokens taken *before* ln_post/proj.
+        """
+        x = self.conv1(images)  # (B, width, grid, grid)
+        x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1)  # (B, grid**2, width)
+        cls = self.class_embedding.to(x.dtype) + torch.zeros(
+            x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device
+        )
+        x = torch.cat([cls, x], dim=1)  # (B, 1+grid**2, width)
+        x = x + self.positional_embedding.to(x.dtype)
+        x = self.ln_pre(x)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer.resblocks(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        return x  # CLS + patch tokens, before ln_post/proj
+
+
+class ClipVisionBackbone(nn.Module):
+    """CLIP visual backbone."""
+
+    def __init__(self, config: DiTConfig):
+        super().__init__()
+        self.clip_model = nn.Module()
+        self.clip_model.visual = CLIPVisualTower(
+            width=config.vit_embed_dim,
+            layers=config.vit_depth,
+            heads=config.vit_num_heads,
+        )
+        self.bfloat16 = False
+
+    def set_bfloat16(self, enabled: bool = True):
+        self.bfloat16 = bool(enabled)
+
+    def encode_image_tokens(self, images):
+        if self.bfloat16 and images.is_cuda:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                tokens = self.clip_model.visual.encode_image_tokens(images)
+            return tokens.to(torch.float32)
+        return self.clip_model.visual.encode_image_tokens(images)
+
+
+def ensure_clip_vision_weights(config: ClipConfig):
+    """Download the CLIP ViT-B/16 checkpoint (used for the vision tower)."""
+    b16_path = Path(config.cache_dir).expanduser() / config.vision_model_name
+    _download_if_missing(config.vision_model_url, b16_path)
+    return b16_path
+
+
+def load_clip_vision_weights(backbone: "ClipVisionBackbone", config: ClipConfig):
+    """Initialize a ClipVisionBackbone from the public OpenAI CLIP ViT-B/16 weights."""
+    b16_path = ensure_clip_vision_weights(config)
+    try:
+        state_dict = torch.jit.load(str(b16_path), map_location="cpu").state_dict()
+    except RuntimeError:
+        state_dict = torch.load(b16_path, map_location="cpu", weights_only=False)
+    visual = {
+        k[len("visual."):]: v for k, v in state_dict.items() if k.startswith("visual.")
+    }
+    missing, unexpected = backbone.clip_model.visual.load_state_dict(visual, strict=False)
+    if missing:
+        raise RuntimeError(
+            f"CLIP ViT-B/16 weights do not cover the visual tower (missing e.g. "
+            f"{missing[:5]}); if the download is corrupt, delete {b16_path} and retry."
+        )
+    return missing, unexpected
+
+
 # DINOv3 ViT-B/16 vision encoder.
 
 
@@ -291,10 +405,6 @@ def _rope_rotate_half(x):
 
 class DinoRope(nn.Module):
     """RoPE over the 2D patch grid (base=100, separate coord normalization).
-
-    rescale_coords=2 applies a random log-uniform rescale of the coordinates
-    during training only — part of the pretraining distribution, kept for
-    finetuning fidelity.
     """
 
     def __init__(self, embed_dim, num_heads, base=100.0, rescale_coords=2.0):
@@ -315,6 +425,8 @@ class DinoRope(nn.Module):
         coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"), dim=-1)
         coords = coords.flatten(0, 1)
         coords = 2.0 * coords - 1.0
+
+        # applies a random log-uniform rescale of the coordinates
         if self.training and self.rescale_coords is not None:
             r = np.log(self.rescale_coords)
             rescale = torch.empty(1, device=dev).uniform_(-r, r).exp()
@@ -411,9 +523,6 @@ class DinoPatchEmbed(nn.Module):
 
 
 class DinoVisionTransformer(nn.Module):
-    """DINOv3 ViT-B/16 with 4 storage tokens. encode_image_tokens() returns
-    (B, 1+196, 768) = CLS + patch tokens (storage tokens dropped), matching
-    the production vision backbone interface."""
 
     N_STORAGE_TOKENS = 4
 
@@ -430,10 +539,6 @@ class DinoVisionTransformer(nn.Module):
         self.init_weights()
 
     def init_weights(self):
-        """Match production's models/dinov3/vision_transformer.py:init_weights_vit.
-        Crucially, this fills `bias_mask` (otherwise NaN-initialized) so that
-        the K-third of every qkv bias is masked to 0 — without this, a fresh
-        DINOv3 produces NaN on its very first forward pass."""
         nn.init.normal_(self.cls_token, std=0.02)
         nn.init.normal_(self.storage_tokens, std=0.02)
         nn.init.zeros_(self.mask_token)
@@ -455,6 +560,7 @@ class DinoVisionTransformer(nn.Module):
                 m.proj.reset_parameters()
 
     def encode_image_tokens(self, images):
+        """returns (B, 1+196, 768) = CLS + patch tokens (storage tokens dropped)."""
         x, H, W = self.patch_embed(images)
         B = x.shape[0]
         cls_token = self.cls_token + 0 * self.mask_token  # production quirk, kept
@@ -471,13 +577,7 @@ class DinoVisionTransformer(nn.Module):
 
 
 class DinoVisionBackbone(nn.Module):
-    """Wrapper around DinoVisionTransformer with an optional bf16-autocast
-    forward path. The wrapper keeps the production checkpoint key layout
-    (`img_backbone.dinov3_model.*`) so the slim 200k checkpoint loads with
-    zero missing/unexpected keys. Set bf16 with set_bfloat16(True): the
-    DINO forward then runs under autocast(bf16) on CUDA, cutting
-    vision-encoder activation memory roughly in half. Tokens are cast back
-    to fp32 on the way out so the surrounding DiT stays dtype-stable.
+    """Wrapper around DinoVisionTransformer with an optional bf16-autocast forward path. 
     """
 
     def __init__(self, config: DiTConfig):
@@ -670,13 +770,19 @@ class DiTPolicy(nn.Module):
 
         self.x_embedder = nn.Linear(config.state_dim, H)
         self.y_embedder = nn.Linear(config.action_dim, H)
-        # Checkpoint compatibility only; unused in forward.
-        self.img_proj = nn.Linear(config.vit_embed_dim, H)
+        # Vestigial from previous checkpoints, we no longer do this projection step in forward but keep for conpat.
+        img_global_dim = (
+            CLIP_VISION_OUTPUT_DIM if config.vision_backbone == "clip" else config.vit_embed_dim
+        )
+        self.img_proj = nn.Linear(img_global_dim, H)
         self.img_proj.requires_grad_(False)
         self.t_embedder = TimestepEmbedder(H)
         self.pos_embed = nn.Parameter(torch.zeros(1, config.chunk_length, H), requires_grad=False)
 
-        self.img_backbone = DinoVisionBackbone(config)
+        if config.vision_backbone == "clip":
+            self.img_backbone = ClipVisionBackbone(config)
+        else:
+            self.img_backbone = DinoVisionBackbone(config)
 
         self.apool_queries = nn.ParameterDict(
             {
@@ -710,8 +816,12 @@ class DiTPolicy(nn.Module):
             nn.Linear(3 * H, H), nn.SiLU(), nn.Linear(H, H), nn.LayerNorm(H)
         )
 
-        self.register_buffer("clip_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("clip_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+        # Image normalization buffers (named clip_* for checkpoint compatibility,
+        # but hold whichever preset the vision backbone expects). Cloned so
+        # checkpoint loads never write into the shared preset constants.
+        norm_mean, norm_std = NORM_PRESETS[preset_for_backbone(config.vision_backbone)]
+        self.register_buffer("clip_mean", norm_mean.reshape(1, 3, 1, 1).clone())
+        self.register_buffer("clip_std", norm_std.reshape(1, 3, 1, 1).clone())
 
         pos = get_1d_sincos_pos_embed(H, config.chunk_length)
         self.pos_embed.data.copy_(torch.from_numpy(pos).float().unsqueeze(0))
@@ -877,15 +987,23 @@ class DiTPolicy(nn.Module):
 
 
 def load_pretrained(model, ckpt_path):
-    """Load the slim production checkpoint (model-only, prefixes stripped)."""
+    """Load a production checkpoint (model-only, compile prefixes stripped)."""
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False, mmap=True)
     sd = ckpt["model"] if "model" in ckpt else ckpt
     sd = {k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k: v for k, v in sd.items()}
     missing, unexpected = model.load_state_dict(sd, strict=False)
-    if unexpected:
-        raise RuntimeError(f"unexpected checkpoint keys: {unexpected[:8]}")
     if missing:
-        raise RuntimeError(f"missing checkpoint keys: {missing[:8]}")
+        raise RuntimeError(
+            f"checkpoint is missing model keys — wrong checkpoint for "
+            f"--model.vision-backbone {model.config.vision_backbone!r}? "
+            f"(e.g. {missing[:8]})"
+        )
+    extra = [k for k in unexpected if not k.startswith("img_backbone.")]
+    if extra:
+        raise RuntimeError(f"unexpected checkpoint keys: {extra[:8]}")
+    if unexpected and os.environ.get("RANK", "0") == "0":
+        print(f"load_pretrained: ignored {len(unexpected)} extra img_backbone keys "
+              f"bundled in the checkpoint (e.g. {unexpected[:3]})")
     return ckpt
 
 

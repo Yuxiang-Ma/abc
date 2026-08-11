@@ -39,8 +39,32 @@ class FlowConfig:
 
 
 @dataclass
+class PromptConfig:
+    """Task/subtask/operator prompt composition.
+    """
+    # Condition on per-frame subtask labels (episodes' subtasks.json sidecars).
+    use_subtask_as_prompt: bool = False
+    # "replace" means the subtask label replaces the task prompt.
+    # "append" formats it according to append format below
+    subtask_mode: Literal["replace", "append"] = "replace"
+    subtask_append_format: str = "{prompt}. {subtask}"
+    # Probability of dropping the subtask label (reverting to the task prompt) during training
+    subtask_dropout_prob: float = 0.2
+
+    # "text_indexed" -> "operator N"; "text_name" -> an English first name from a fixed pool (overflow falls back to "operator N").
+    use_operator_id_as_prompt: bool = False
+    operator_prompting_mode: Literal["text_indexed", "text_name"] = "text_indexed"
+    operator_append_format: str = "{prompt}. {operator}"
+    # Per-task label-map manifest; required when operator prompting is on.
+    # Build a priori with scripts/build_operator_label_map.py.
+    operator_label_map_path: str = ""
+    # Probability of dropping the operator label
+    operator_dropout_prob: float = 0.2
+
+
+@dataclass
 class ClipConfig:
-    """CLIP ViT-B/32 text asset locations."""
+    """CLIP asset cache: ViT-B/32 text encoder + ViT-B/16 vision weights."""
     cache_dir: str = field(default_factory=lambda: str(Path.home() / ".cache" / "clip"))
     model_url: str = (
         "https://openaipublic.azureedge.net/clip/models/"
@@ -51,6 +75,11 @@ class ClipConfig:
     )
     model_name: str = "ViT-B-32.pt"
     bpe_name: str = "bpe_simple_vocab_16e6.txt.gz"
+    vision_model_url: str = (
+        "https://openaipublic.azureedge.net/clip/models/"
+        "5806e77cd80f8b59890b7e101eabd078d9fb84e6937f9e85e4ecb61988df416f/ViT-B-16.pt"
+    )
+    vision_model_name: str = "ViT-B-16.pt"
 
 
 @dataclass
@@ -74,6 +103,9 @@ class DiTConfig:
     chunk_length: int = 30
     camera_keys: tuple[str, ...] = ("top", "left", "right")
     task_embed_dim: int = 512
+
+    # Vision backbone: "dinov3" or "clip"
+    vision_backbone: Literal["dinov3", "clip"] = "dinov3"
 
     vit_embed_dim: int = 768
     vit_depth: int = 12
@@ -117,11 +149,13 @@ class PutBottlesSimConfig:
     eval_max_rel_z: float = 0.26
 
 
-# Reference hours-weighted real+sim bottles mix.
 MIXTURE_PRESETS: dict[str, list[MixtureComponent]] = {
     "bottles": [
         MixtureComponent("train_real", "val_real", 0.8172, "throw_plastic_bottles_in_bin"),
         MixtureComponent("train_sim", "val_sim", 0.1828, "sim_put_the_plastic_bottles_in_the_bin"),
+    ],
+    "tshirt": [
+        MixtureComponent("train_real", "val_real", 1.0, "folding_tshirt_pile_and_stacking"),
     ],
 }
 
@@ -137,10 +171,14 @@ class TrainConfig:
     num_workers: int = 16
     train_steps: int = 75_000
 
-    mixture_preset: Literal["bottles"] = "bottles"
+    mixture_preset: Literal["bottles", "tshirt"] = "bottles"
     mixture: list[MixtureComponent] = field(default_factory=list)
 
     load_pretrained: bool = False
+    pretrained_ckpt_name: str = "abc_dit_xl_200k_model.pt"
+    # When finetuning from a checkpoint that embeds norm_stats, use those instead
+    # of cache/norm_stats.json so inputs are scaled exactly as during pretraining.
+    inherit_ckpt_norm_stats: bool = True
     resume_from: str | None = None
     dino_bf16: bool = True
     compile: bool = True
@@ -154,6 +192,7 @@ class TrainConfig:
 
     optim: OptimConfig = field(default_factory=OptimConfig)
     flow: FlowConfig = field(default_factory=FlowConfig)
+    prompt: PromptConfig = field(default_factory=PromptConfig)
     clip: ClipConfig = field(default_factory=ClipConfig)
     model: DiTConfig = field(default_factory=DiTConfig)
 
@@ -261,6 +300,21 @@ def validate_train_config(
         )
     errors.extend(validate_model_config(config.model))
     if (
+        not 0 <= config.prompt.subtask_dropout_prob <= 1
+        or not 0 <= config.prompt.operator_dropout_prob <= 1
+    ):
+        errors.append("prompt dropout probabilities must be in [0, 1]")
+    for name in ("subtask_append_format", "operator_append_format"):
+        try:
+            getattr(config.prompt, name).format(prompt="p", subtask="s", operator="o")
+        except (KeyError, IndexError, ValueError) as e:
+            errors.append(f"prompt.{name} is not renderable: {e!r}")
+    if config.prompt.use_operator_id_as_prompt and not config.prompt.operator_label_map_path:
+        errors.append(
+            "operator prompting requires --prompt.operator-label-map-path; build the "
+            "manifest a priori with scripts/build_operator_label_map.py"
+        )
+    if (
         not components
         or any(not math.isfinite(w) or w <= 0 for w in weights)
         or not math.isclose(sum(weights), 1.0, rel_tol=0.0, abs_tol=1e-6)
@@ -270,10 +324,15 @@ def validate_train_config(
             f"got {sum(weights) if weights else 0:.8g}"
         )
 
-    required = [cache_root / "norm_stats.json"]
-    required += [cache_root / p for c in components for p in (c.train_dir, c.val_dir)]
+    required = [cache_root / p for c in components for p in (c.train_dir, c.val_dir)]
     if config.load_pretrained:
         required.append(checkpoint_path)
+    if config.prompt.use_operator_id_as_prompt and config.prompt.operator_label_map_path:
+        required.append(Path(config.prompt.operator_label_map_path).expanduser())
+    # norm_stats.json is only required when we are NOT inheriting stats embedded
+    # in a checkpoint (pretrained parent or resume checkpoint; see train_loop.main)
+    if not (config.inherit_ckpt_norm_stats and (config.load_pretrained or config.resume_from)):
+        required.append(cache_root / "norm_stats.json")
     if config.resume_from:
         required.append(Path(config.resume_from).expanduser())
     missing = [str(path) for path in required if not path.exists()]
