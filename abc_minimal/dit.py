@@ -697,12 +697,19 @@ class DiTBlock(nn.Module):
             nn.SiLU(), nn.Linear(hidden_size, 9 * hidden_size, bias=True)
         )
 
-    def forward(self, x, c, vision_tokens):
+    def forward(self, x, c, vision_tokens, prefix_mask=None):
+        modulation = self.adaLN_modulation(c)
+        if prefix_mask is not None:
+            modulation = torch.where(
+                prefix_mask.unsqueeze(-1),
+                modulation[:, :1],
+                modulation[:, 1:],
+            )
         (
             shift_msa, scale_msa, gate_msa,
             shift_xattn, scale_xattn, gate_xattn,
             shift_mlp, scale_mlp, gate_mlp,
-        ) = self.adaLN_modulation(c).chunk(9, dim=-1)
+        ) = modulation.chunk(9, dim=-1)
 
         x = x + gate_residual(gate_msa, self.attn(modulate(self.norm1(x), shift_msa, scale_msa)))
 
@@ -724,8 +731,15 @@ class FinalLayer(nn.Module):
             nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True)
         )
 
-    def forward(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
+    def forward(self, x, c, prefix_mask=None):
+        modulation = self.adaLN_modulation(c)
+        if prefix_mask is not None:
+            modulation = torch.where(
+                prefix_mask.unsqueeze(-1),
+                modulation[:, :1],
+                modulation[:, 1:],
+            )
+        shift, scale = modulation.chunk(2, dim=-1)
         return self.linear(modulate(self.norm_final(x), shift, scale))
 
 
@@ -829,9 +843,17 @@ class DiTPolicy(nn.Module):
     def build_vision_tokens(self, images):
         """images: dict cam -> (B, 3, 224, 224), already ImageNet-normalized.
         Returns (B, num_cameras * queries, hidden)."""
+        batch_size = images[self.camera_keys[0]].shape[0]
+        camera_count = len(self.camera_keys)
+        all_images = torch.cat([images[cam] for cam in self.camera_keys], dim=0)
+        all_tokens = self.img_backbone.encode_image_tokens(all_images)
+        all_tokens = all_tokens.reshape(
+            camera_count, batch_size, all_tokens.shape[1], all_tokens.shape[2]
+        )
+
         pooled = []
-        for cam in self.camera_keys:
-            tokens = self.img_backbone.encode_image_tokens(images[cam])
+        for index, cam in enumerate(self.camera_keys):
+            tokens = all_tokens[index]
             tokens = tokens.to(self.apool_queries[cam].dtype)
             queries = self.apool_queries[cam].expand(tokens.shape[0], -1, -1)
             pooled.append(self.apool[cam](tokens, queries))
@@ -865,11 +887,11 @@ class DiTPolicy(nn.Module):
                 return self.cond_proj(cond_concat).to(model_dtype)
         return self.cond_proj(cond_concat).to(model_dtype)
 
-    def predict_velocity(self, x_t, c, vision_tokens):
+    def predict_velocity(self, x_t, c, vision_tokens, prefix_mask=None):
         z = self.y_embedder(x_t) + self.pos_embed.data[:, : x_t.shape[1], :]
         for block in self.blocks:
-            z = block(z, c, vision_tokens)
-        return self.final_layer(z, c)
+            z = block(z, c, vision_tokens, prefix_mask)
+        return self.final_layer(z, c, prefix_mask)
 
     def forward(
         self,
@@ -972,15 +994,15 @@ class DiTPolicy(nn.Module):
         vision_tokens = self.build_vision_tokens(batch["images"])
         dt = -1.0 / num_steps
         for i in range(num_steps):
-            t = torch.full(
-                (B, self.chunk_length),
-                1.0 + i * dt,
-                device=state.device,
-                dtype=model_dtype,
+            t = torch.full((B,), 1.0 + i * dt, device=state.device, dtype=model_dtype)
+            t_pair = torch.stack([torch.zeros_like(t), t], dim=1)
+            c_pair = self.compute_cond(state, batch["task_vec_clip"], t_pair)
+            v = self.predict_velocity(
+                x_t,
+                c_pair,
+                vision_tokens,
+                prefix_t_mask,
             )
-            t = torch.where(prefix_t_mask, torch.zeros_like(t), t)
-            c = self.compute_cond(state, batch["task_vec_clip"], t)
-            v = self.predict_velocity(x_t, c, vision_tokens)
             x_t = x_t + v * dt
             x_t = torch.where(prefix_mask, action_prefix, x_t)
         return x_t

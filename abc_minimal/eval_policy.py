@@ -19,20 +19,13 @@ import mujoco
 import numpy as np
 import torch
 
-from abc_minimal.config import FlowConfig, PutBottlesSimConfig, SimEvalConfig, validate_model_config
-from abc_minimal.dit import (
-    CLIPTextEmbedder,
-    DiTPolicy,
-    load_pretrained,
+from abc_minimal.config import (
+    FlowConfig,
+    PutBottlesSimConfig,
+    SimEvalConfig,
+    validate_model_config,
 )
-from abc_minimal.fast_inference import FastInferenceGraph, FastRTCInferenceGraph
-from abc_minimal.preprocess import (
-    normalize,
-    parse_norm_stats,
-    preset_for_backbone,
-    resize_pad_normalize,
-    unnormalize,
-)
+from abc_minimal.policy import DiTInferencePolicy as SimPolicy
 
 torch.set_float32_matmul_precision("high")
 
@@ -499,19 +492,6 @@ class PutBottlesEnv:
         }
 
 
-# Policy adapter.
-
-
-def resolve_norm_stats(ckpt: dict[str, Any], override: str | None) -> dict[str, Any]:
-    if override:
-        raw = json.loads(Path(override).expanduser().read_text())
-    elif ckpt.get("norm_stats") is not None:
-        raw = ckpt["norm_stats"]
-    else:
-        raise ValueError("No norm_stats in checkpoint; pass --norm-stats-path")
-    return parse_norm_stats(raw)
-
-
 class _RTCManager:
     def __init__(
         self,
@@ -573,152 +553,6 @@ class _RTCManager:
             self._pending.result()
             self._pending = None
         self._executor.shutdown(wait=True)
-
-
-class SimPolicy:
-    def __init__(self, checkpoint: Path, config: SimEvalConfig, device: str):
-        self.config = config
-        self.device = torch.device(device)
-        self.diffusion_steps = config.diffusion_steps
-        self.model = DiTPolicy(config.model).to(self.device)
-        ckpt = load_pretrained(self.model, checkpoint)
-        self.model.eval()
-        self.norm_preset = preset_for_backbone(config.model.vision_backbone)
-        self.norm_stats = resolve_norm_stats(ckpt, config.norm_stats_path)
-        self.embedder = CLIPTextEmbedder(config.clip, device=self.device)
-        self.task_vec = self.embedder.encode([config.prompt]).to(self.device)
-        self._fast_graph: FastInferenceGraph | None = None
-        self._fast_rtc_graphs: dict[int, FastRTCInferenceGraph] = {}
-
-    def enable_fast_inference(
-        self,
-        compile_mode: str = "max-autotune-no-cudagraphs",
-        replay_warmups: int = 24,
-        warmup_obs: dict[str, Any] | None = None,
-        warmup_noise: np.ndarray | None = None,
-    ) -> None:
-        """Compile velocity prediction and capture sample_actions in a CUDA graph."""
-        if self._fast_graph is not None:
-            return
-        if self.device.type != "cuda":
-            raise RuntimeError("fast inference requires a CUDA device")
-
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
-
-        self.model.to(torch.bfloat16)
-        self.model.img_backbone.set_bfloat16(True)
-        self.task_vec = self.task_vec.to(device=self.device, dtype=torch.bfloat16)
-
-        compile_kwargs: dict[str, Any] = {"dynamic": False}
-        if compile_mode:
-            compile_kwargs["mode"] = compile_mode
-        self.model.predict_velocity = torch.compile(
-            self.model.predict_velocity, **compile_kwargs
-        )
-
-        m = self.config.model
-        if warmup_obs is None:
-            warmup_obs = {
-                "state": np.zeros(m.state_dim, dtype=np.float32),
-                "images": {
-                    cam: np.zeros(
-                        (3, self.config.camera_height, self.config.camera_width),
-                        dtype=np.uint8,
-                    )
-                    for cam in m.camera_keys
-                },
-                "prompt": self.config.prompt,
-            }
-        if warmup_noise is None:
-            warmup_noise = np.zeros((m.chunk_length, m.action_dim), dtype=np.float32)
-        self._fast_graph = FastInferenceGraph(self)
-        self._fast_graph.capture(warmup_obs, warmup_noise, replay_warmups)
-
-    def normalized_action_prefix(
-        self,
-        action_prefix: np.ndarray,
-        prefix_length: int,
-    ) -> np.ndarray:
-        m = self.config.model
-        prefix = np.asarray(action_prefix, dtype=np.float32)
-        if prefix.shape == (prefix_length, m.action_dim):
-            full_prefix = np.zeros((m.chunk_length, m.action_dim), dtype=np.float32)
-            full_prefix[:prefix_length] = prefix
-            prefix = full_prefix
-        if prefix.shape != (m.chunk_length, m.action_dim):
-            raise ValueError(
-                f"action_prefix must have shape {(m.chunk_length, m.action_dim)} "
-                f"or {(prefix_length, m.action_dim)}, got {prefix.shape}"
-            )
-        return normalize(prefix, self.norm_stats["actions"]).astype(np.float32, copy=False)
-
-    def warmup_rtc(
-        self,
-        obs: dict[str, Any],
-        noise: np.ndarray | None,
-        prefix_length: int,
-    ) -> None:
-        m = self.config.model
-        action_prefix = np.zeros((m.chunk_length, m.action_dim), dtype=np.float32)
-        if self._fast_graph is not None and self.device.type == "cuda":
-            graph = FastRTCInferenceGraph(self, prefix_length)
-            graph.capture(obs, noise, action_prefix, replay_warmups=8)
-            self._fast_rtc_graphs[prefix_length] = graph
-        else:
-            _ = self.infer(
-                obs,
-                noise=noise,
-                action_prefix=action_prefix,
-                prefix_length=prefix_length,
-            )
-            if self.device.type == "cuda":
-                torch.cuda.synchronize()
-
-    @torch.no_grad()
-    def infer(
-        self,
-        obs: dict[str, Any],
-        noise: np.ndarray | None = None,
-        action_prefix: np.ndarray | None = None,
-        prefix_length: int = 0,
-    ) -> np.ndarray:
-        if action_prefix is None and self._fast_graph is not None:
-            return self._fast_graph.infer(obs, noise)
-        if action_prefix is not None and prefix_length in self._fast_rtc_graphs:
-            return self._fast_rtc_graphs[prefix_length].infer(obs, noise, action_prefix)
-        state = normalize(np.asarray(obs["state"], dtype=np.float32), self.norm_stats["state"])
-        batch = {
-            "state": torch.from_numpy(state[None]).float().to(self.device),
-            "actions": torch.zeros(
-                1, self.config.model.chunk_length, self.config.model.action_dim, device=self.device
-            ),
-            "images": {
-                cam: resize_pad_normalize(obs["images"][cam], preset=self.norm_preset)
-                .unsqueeze(0).to(self.device)
-                for cam in self.config.model.camera_keys
-            },
-            "task_vec_clip": self.task_vec,
-        }
-        noise_t = None
-        if noise is not None:
-            noise_t = torch.from_numpy(noise[None].astype(np.float32)).to(self.device)
-        if action_prefix is None:
-            actions = self.model.sample_actions(batch, num_steps=self.diffusion_steps, noise=noise_t)
-        else:
-            prefix_t = torch.from_numpy(
-                self.normalized_action_prefix(action_prefix, prefix_length)[None]
-            ).to(device=self.device, dtype=batch["state"].dtype)
-            actions = self.model.sample_actions_rtc(
-                batch,
-                prefix_t,
-                prefix_length=prefix_length,
-                num_steps=self.diffusion_steps,
-                noise=noise_t,
-            )
-        actions_np = actions[0].float().detach().cpu().numpy()
-        return unnormalize(actions_np, self.norm_stats["actions"]).astype(np.float32)
 
 
 # Rollout.

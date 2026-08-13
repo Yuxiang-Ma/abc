@@ -62,6 +62,9 @@ class FastInferenceGraph:
 
     def _copy_inputs(self, obs: dict[str, Any], noise: np.ndarray | None) -> None:
         m = self.policy.config.model
+        self.static_task_vec.copy_(
+            self.policy.task_vec.to(device=self.device, dtype=self.dtype)
+        )
         state = normalize(
             np.asarray(obs["state"], dtype=np.float32), self.policy.norm_stats["state"]
         )

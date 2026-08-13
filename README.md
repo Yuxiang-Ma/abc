@@ -13,7 +13,9 @@
 
 Code for the ABC project.
 
-> Note: we have released a minimal training pipeline for ABC-DiT & conversion scripts for the data. We also re-host a small subset of the sim data and real data for 1 task to allow users to get started. Please check back later for the full code release, including VLA training, real deployment infra & pretrained checkpoints.
+> Note: we have released a minimal ABC-DiT training and real-robot deployment
+> pipeline, plus data conversion scripts. VLA training and deployment are not
+> part of this release yet.
 
 
 ## Release Roadmap
@@ -165,6 +167,12 @@ faster to use vanilla mujoco. Rendering still happens in MJWarp.
 
 Note that the first launch compiles MJWarp's CUDA kernels (~1 min).
 
+## Real-robot deployment
+
+The DiT-only deployment stack, including RTC, teleoperation, and recording, is
+documented in [`deploy/README.md`](deploy/README.md). Install its optional
+hardware dependencies with `uv sync --extra deploy`.
+
 ## Episode exports & training data format
 
 While we host a single task in training format, there are many more in the ABC Dataset.
@@ -298,12 +306,14 @@ for these training will drop back to task prompt only.
 
 This repository includes and adapts code from the following third-party
 projects. Original license files and copyright headers are retained in all
-cases. Bundled license texts live under `abc_minimal/third_party/`.
+cases. Bundled license texts live under `assets/third_party/`.
 
 | Project | License | License file | Inclusion | What we use/adapt |
 | --- | --- | --- | --- | --- |
-| [DINOv3](https://github.com/facebookresearch/dinov3) | DINOv3 License (Meta) | [`abc_minimal/third_party/dinov3/LICENSE.md`](abc_minimal/third_party/dinov3/LICENSE.md) | Adapted (`abc_minimal/dit.py`); pretrained weights downloaded by the user | ViT-B/16 vision backbone (`DinoRope`, `DinoAttention`, `DinoMlp`, etc.) |
-| [OpenAI CLIP](https://github.com/openai/CLIP) | MIT | [`abc_minimal/third_party/clip/LICENSE`](abc_minimal/third_party/clip/LICENSE) | Adapted (`abc_minimal/dit.py`); ViT-B/32 text weights + BPE vocab downloaded at runtime | CLIP text encoder + BPE tokenizer (`CLIPBPETokenizer`, `CLIPTextTower`, `CLIPTextEmbedder`) |
+| [DINOv3](https://github.com/facebookresearch/dinov3) | DINOv3 License (Meta) | [`assets/third_party/dinov3/LICENSE.md`](assets/third_party/dinov3/LICENSE.md) | Adapted (`abc_minimal/dit.py`); pretrained weights downloaded by the user | ViT-B/16 vision backbone (`DinoRope`, `DinoAttention`, `DinoMlp`, etc.) |
+| [OpenAI CLIP](https://github.com/openai/CLIP) | MIT | [`assets/third_party/clip/LICENSE`](assets/third_party/clip/LICENSE) | Adapted (`abc_minimal/dit.py`); ViT-B/32 text weights + BPE vocab downloaded at runtime | CLIP text encoder + BPE tokenizer (`CLIPBPETokenizer`, `CLIPTextTower`, `CLIPTextEmbedder`) |
+| [openpi](https://github.com/Physical-Intelligence/openpi) | Apache 2.0 | [`assets/third_party/openpi/LICENSE`](assets/third_party/openpi/LICENSE) | Adapted (`deploy/client/websocket_client_policy.py`, `deploy/client/msgpack_numpy.py`) | Websocket inference client skeleton + msgpack NumPy serialization |
+| [msgpack-numpy](https://github.com/lebedov/msgpack-numpy) | BSD 3-Clause | [`assets/third_party/msgpack_numpy/LICENSE.md`](assets/third_party/msgpack_numpy/LICENSE.md) | Adapted (`deploy/client/msgpack_numpy.py`, via openpi) | NumPy serialization strategy for msgpack |
 | [i2rt YAM](https://github.com/i2rt-robotics) | MIT | [`assets/put_bottles/assets/i2rt_yam/LICENSE`](assets/put_bottles/assets/i2rt_yam/LICENSE) | Vendored under `assets/put_bottles/assets/i2rt_yam/` | YAM robot MuJoCo model, meshes, and scene assets |
 
 ### DINOv3 use restrictions
@@ -313,7 +323,7 @@ derivatives) for: military purposes; activities subject to ITAR or other
 export-control regimes covering defense articles; nuclear applications;
 espionage; and the development, manufacture, or use of weapons. Downstream
 users who load DINOv3 weights through this codebase are bound by these
-restrictions; see `abc_minimal/third_party/dinov3/LICENSE.md` for the full
+restrictions; see `assets/third_party/dinov3/LICENSE.md` for the full
 license text.
 
 

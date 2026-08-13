@@ -221,7 +221,7 @@ class SimEvalConfig:
     device: str = "auto"
     gpu_id: int | None = None
     fast_inference: bool = True
-    fast_compile_mode: str = "max-autotune-no-cudagraphs"
+    fast_compile_mode: str = "max-autotune"
     vanilla_physics: bool = False
     rtc: bool = False
     rtc_prefix_length: int = 4
@@ -249,7 +249,7 @@ class VizPolicyConfig:
     sim: VizSimEvalConfig
     port: int = 8080
     fast_inference: bool = True
-    fast_compile_mode: str = "max-autotune-no-cudagraphs"
+    fast_compile_mode: str = "max-autotune"
 
 
 def validate_model_config(model: DiTConfig) -> list[str]:

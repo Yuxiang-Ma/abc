@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "abc-minimal"
 version = "0.1.0"
@@ -27,6 +31,31 @@ dependencies = [
     # Optional: W&B logging in train.py (off by default; --log-wandb to enable).
     "wandb",
 ]
+
+[project.optional-dependencies]
+deploy = [
+    "dynamixel-sdk",
+    "evdev; sys_platform == 'linux'",
+    "gymnasium>=1.1",
+    "h5py",
+    "i2rt @ git+https://github.com/arthurallshire/i2rt-drivers.git@852f6fff33970fe9b882c53e6b28c66172c97291",
+    "msgpack",
+    "mink==1.1.0",
+    "opencv-python",
+    "pyrealsense2; sys_platform == 'linux'",
+    "pyzmq",
+    "websockets",
+]
+dev = ["ruff"]
+
+[tool.uv]
+override-dependencies = [
+    "mujoco==3.6.0",  # mjviser floor; i2rt's real-robot path uses stable APIs.
+    "tyro>=1.0.5",
+]
+
+[tool.setuptools.packages.find]
+include = ["abc_minimal*", "deploy*"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
