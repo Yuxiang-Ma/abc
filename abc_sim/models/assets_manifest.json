@@ -1,0 +1,503 @@
+{
+  "archive_format": "tar.gz",
+  "base_uri": "https://abc-data.timehorizons.org/sim_assets/",
+  "created_at": "2026-08-12T19:48:40Z",
+  "format": "abc_sim_assets_manifest/v1",
+  "packages": [
+    {
+      "archive": "ball_sorting_toy.tar.gz",
+      "contains": [
+        "ball_sorting_toy"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 286,
+      "name": "ball_sorting_toy",
+      "sha256": "94703e662b4f700933701e5fa820c1a9579fb42644997569cc171a1116cffbda",
+      "size_bytes": 11290215,
+      "unpacked_size_bytes": 15441448,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/ball_sorting_toy.tar.gz"
+    },
+    {
+      "archive": "bin.tar.gz",
+      "contains": [
+        "bin"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 21,
+      "name": "bin",
+      "sha256": "72f56ed1dc9a68e0e62fc6f744bf4f0fc65766e0d99528cb6378d0ccaedb5235",
+      "size_bytes": 2146497,
+      "unpacked_size_bytes": 2395106,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/bin.tar.gz"
+    },
+    {
+      "archive": "blocks.tar.gz",
+      "contains": [
+        "blocks"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 29,
+      "name": "blocks",
+      "sha256": "ffb892f424a4d4e26f4f3f5e9cf3118e47d1dd1b9e98ff3d2514623b604efa6a",
+      "size_bytes": 8348357,
+      "unpacked_size_bytes": 8515987,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/blocks.tar.gz"
+    },
+    {
+      "archive": "bowl.tar.gz",
+      "contains": [
+        "bowl"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 37,
+      "name": "bowl",
+      "sha256": "5479b4585a490559becf413bfba5c17618ffeecf954e61dbf62b381a8e47f592",
+      "size_bytes": 1916555,
+      "unpacked_size_bytes": 6332190,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/bowl.tar.gz"
+    },
+    {
+      "archive": "brush.tar.gz",
+      "contains": [
+        "brush"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 28,
+      "name": "brush",
+      "sha256": "d2a5864ab1f2c164baa4b77f3a23907a63c1dd63676b293d727792e0a1110faa",
+      "size_bytes": 1532320,
+      "unpacked_size_bytes": 2126590,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/brush.tar.gz"
+    },
+    {
+      "archive": "brush_flat.tar.gz",
+      "contains": [
+        "brush_flat"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 7,
+      "name": "brush_flat",
+      "sha256": "1f6b3fddefd555b688c06f5dfb1cd111dc4e406bb3bee18f3fa42c90fd52007c",
+      "size_bytes": 1796736,
+      "unpacked_size_bytes": 2150545,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/brush_flat.tar.gz"
+    },
+    {
+      "archive": "building_blocks.tar.gz",
+      "contains": [
+        "building_blocks"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 82,
+      "name": "building_blocks",
+      "sha256": "8eab4f55490a7f0bff53cf156898c8d50acda1a7cc0d61284f95475e1be21ddf",
+      "size_bytes": 7999553,
+      "unpacked_size_bytes": 9181921,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/building_blocks.tar.gz"
+    },
+    {
+      "archive": "chess.tar.gz",
+      "contains": [
+        "chess"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 34,
+      "name": "chess",
+      "sha256": "0e91795f17a81006f65743707a6fd3395c36a02b75d4ee934e499fe554edbfa5",
+      "size_bytes": 15229664,
+      "unpacked_size_bytes": 49455315,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/chess.tar.gz"
+    },
+    {
+      "archive": "cup_stacking.tar.gz",
+      "contains": [
+        "cup_stacking"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 51,
+      "name": "cup_stacking",
+      "sha256": "0bd60a4a11e038a88cabbecc8b4baf71123d4c371f98219250c36386e9aaacf2",
+      "size_bytes": 27552,
+      "unpacked_size_bytes": 115279,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/cup_stacking.tar.gz"
+    },
+    {
+      "archive": "dishrack.tar.gz",
+      "contains": [
+        "dishrack"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 153,
+      "name": "dishrack",
+      "sha256": "9c37f06e0b07db9359f0e4306c9c8e24f87ef0910c95fac13e7bdd9c36b0f06c",
+      "size_bytes": 6581904,
+      "unpacked_size_bytes": 15574053,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/dishrack.tar.gz"
+    },
+    {
+      "archive": "drawer.tar.gz",
+      "contains": [
+        "drawer"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 14,
+      "name": "drawer",
+      "sha256": "cb72a74b930108ff25ada30bd527eb52faf5a5b0ef636f1e47919b36f15dc4a7",
+      "size_bytes": 5178,
+      "unpacked_size_bytes": 18376,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/drawer.tar.gz"
+    },
+    {
+      "archive": "dustpan.tar.gz",
+      "contains": [
+        "dustpan"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 20,
+      "name": "dustpan",
+      "sha256": "9746caee3de796f7da66c6d200f5a391c746e75c9941460f299fbd400b820761",
+      "size_bytes": 809105,
+      "unpacked_size_bytes": 976648,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/dustpan.tar.gz"
+    },
+    {
+      "archive": "flexible_gripper.tar.gz",
+      "contains": [
+        "flexible_gripper"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 4,
+      "name": "flexible_gripper",
+      "sha256": "e393fdd7ec8172f80bbc9b3ee4ef6dbef8cc587e3ae33888faf5c4c38a31bd07",
+      "size_bytes": 1086590,
+      "unpacked_size_bytes": 3748465,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/flexible_gripper.tar.gz"
+    },
+    {
+      "archive": "garbage_can.tar.gz",
+      "contains": [
+        "garbage_can"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 17,
+      "name": "garbage_can",
+      "sha256": "fee5374110e3a805539fb876962765db169c91bcba9d6bf92207551cf318d5a2",
+      "size_bytes": 148683,
+      "unpacked_size_bytes": 423327,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/garbage_can.tar.gz"
+    },
+    {
+      "archive": "hand_brush_smooth.tar.gz",
+      "contains": [
+        "hand_brush_smooth"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 5,
+      "name": "hand_brush_smooth",
+      "sha256": "d3fa2efc447a8a1733273e455278486929a9d995f73be1c957df34157ef22233",
+      "size_bytes": 1490815,
+      "unpacked_size_bytes": 1960993,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/hand_brush_smooth.tar.gz"
+    },
+    {
+      "archive": "i2rt_yam.tar.gz",
+      "contains": [
+        "i2rt_yam"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 22,
+      "name": "i2rt_yam",
+      "sha256": "ed5144c0b4ae55da75a3701b5bad9ca3599977cc8b73c59996e5e1633749aad7",
+      "size_bytes": 4566683,
+      "unpacked_size_bytes": 15613217,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/i2rt_yam.tar.gz"
+    },
+    {
+      "archive": "jenga.tar.gz",
+      "contains": [
+        "jenga"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 3,
+      "name": "jenga",
+      "sha256": "b3c1acc2452898f86af332540f686ab02d91b0be1d3de4e939e717b88ff4c529",
+      "size_bytes": 2567459,
+      "unpacked_size_bytes": 2613989,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/jenga.tar.gz"
+    },
+    {
+      "archive": "letters.tar.gz",
+      "contains": [
+        "letters"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 26,
+      "name": "letters",
+      "sha256": "dd13f32b0e463241b5e626ccd6e93b830b9187328c82a922637e7e95004e7f47",
+      "size_bytes": 9148513,
+      "unpacked_size_bytes": 9146787,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/letters.tar.gz"
+    },
+    {
+      "archive": "marker.tar.gz",
+      "contains": [
+        "marker"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 52,
+      "name": "marker",
+      "sha256": "faa8f048bc8a1cb713924e6ece5f34a2a461099dc953ebd8e85aee9c016dc9f6",
+      "size_bytes": 831358,
+      "unpacked_size_bytes": 1105799,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/marker.tar.gz"
+    },
+    {
+      "archive": "mug.tar.gz",
+      "contains": [
+        "mug"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 36,
+      "name": "mug",
+      "sha256": "06fe8d31f4849443bcdbe6decc7151d77744f4877afd3ae6cd57b98f0d7c165d",
+      "size_bytes": 365110,
+      "unpacked_size_bytes": 1791202,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/mug.tar.gz"
+    },
+    {
+      "archive": "mug_tree.tar.gz",
+      "contains": [
+        "mug_tree"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 14,
+      "name": "mug_tree",
+      "sha256": "988d5f6455fd24f44f046d3ee88dddb867025ea05b84bcb22ed7f168a39fd71b",
+      "size_bytes": 4347322,
+      "unpacked_size_bytes": 5193869,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/mug_tree.tar.gz"
+    },
+    {
+      "archive": "new_brush.tar.gz",
+      "contains": [
+        "new_brush"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 10,
+      "name": "new_brush",
+      "sha256": "eefbd71a64294c502656aa7ae0d1040164e352a215dd11316ee70bcdb2256f29",
+      "size_bytes": 72260,
+      "unpacked_size_bytes": 269253,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/new_brush.tar.gz"
+    },
+    {
+      "archive": "paper_ball.tar.gz",
+      "contains": [
+        "paper_ball"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 19,
+      "name": "paper_ball",
+      "sha256": "f3b816f9bc654f03c2af4e8f277e25b8881769c4132769fd6eb591a944bfcc08",
+      "size_bytes": 1211610,
+      "unpacked_size_bytes": 8155111,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/paper_ball.tar.gz"
+    },
+    {
+      "archive": "plate.tar.gz",
+      "contains": [
+        "plate"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 20,
+      "name": "plate",
+      "sha256": "b0ddd527009b129ad15f84343f8c9d2803a3c4092718ca5d8e1fd2d46e92e545",
+      "size_bytes": 3699796,
+      "unpacked_size_bytes": 8404005,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/plate.tar.gz"
+    },
+    {
+      "archive": "task_bins.tar.gz",
+      "contains": [
+        "task_bins"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 29,
+      "name": "task_bins",
+      "sha256": "5229ca71cbcf4bf243033d42a384266b0f0cdf40388e0d59484678ac60095e21",
+      "size_bytes": 128004,
+      "unpacked_size_bytes": 419373,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/task_bins.tar.gz"
+    },
+    {
+      "archive": "task_chess.tar.gz",
+      "contains": [
+        "task_chess"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 20,
+      "name": "task_chess",
+      "sha256": "093c1ab6389932dab39c58d31639e353a865655a6676ee253f303f9cbc7b5ffa",
+      "size_bytes": 6235302,
+      "unpacked_size_bytes": 6375417,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/task_chess.tar.gz"
+    },
+    {
+      "archive": "task_conveyor_pick_v2.tar.gz",
+      "contains": [
+        "task_conveyor_pick"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 977,
+      "name": "task_conveyor_pick",
+      "sha256": "e229fc943dc245b75dbf5af236beb28e3f5d57615493572cd15d02da61454f99",
+      "size_bytes": 118652968,
+      "unpacked_size_bytes": 276407656,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/task_conveyor_pick_v2.tar.gz"
+    },
+    {
+      "archive": "task_dishrack.tar.gz",
+      "contains": [
+        "task_dishrack"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 1038,
+      "name": "task_dishrack",
+      "sha256": "e025985d199ae42b4b935deef42aa28adb4af625d45747120fc313976221b0b1",
+      "size_bytes": 53634922,
+      "unpacked_size_bytes": 171676599,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/task_dishrack.tar.gz"
+    },
+    {
+      "archive": "task_grab_clutter.tar.gz",
+      "contains": [
+        "task_grab_clutter"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 466,
+      "name": "task_grab_clutter",
+      "sha256": "cf32ff2d2b2567053e4e174e98097695c478bc7d62d34cd250b9e07457f593a9",
+      "size_bytes": 68193986,
+      "unpacked_size_bytes": 105493876,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/task_grab_clutter.tar.gz"
+    },
+    {
+      "archive": "task_inhand_transfer.tar.gz",
+      "contains": [
+        "task_inhand_transfer"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 2958,
+      "name": "task_inhand_transfer",
+      "sha256": "d51a595ff0a4078f737d71043343080d8be1b501554ebb8bf5b49f4f52269a12",
+      "size_bytes": 92616010,
+      "unpacked_size_bytes": 232779669,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/task_inhand_transfer.tar.gz"
+    },
+    {
+      "archive": "task_mug_flip.tar.gz",
+      "contains": [
+        "task_mug_flip"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 985,
+      "name": "task_mug_flip",
+      "sha256": "b0d43a4856cdd72f1aed2b9d05e489fbd1a553458d3a497917dd74b3d1950744",
+      "size_bytes": 13125277,
+      "unpacked_size_bytes": 45014139,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/task_mug_flip.tar.gz"
+    },
+    {
+      "archive": "task_mug_tree.tar.gz",
+      "contains": [
+        "task_mug_tree"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 985,
+      "name": "task_mug_tree",
+      "sha256": "a23dea938cb6abb4e907d4e4e52e2d9797221bc6dda2027f1452a8447de6cb50",
+      "size_bytes": 13125351,
+      "unpacked_size_bytes": 45014139,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/task_mug_tree.tar.gz"
+    },
+    {
+      "archive": "task_multi_drawer_search.tar.gz",
+      "contains": [
+        "task_multi_drawer_search"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 218,
+      "name": "task_multi_drawer_search",
+      "sha256": "b0ac5a7da7f98d91518bb08d383c898faa44bea9fc590d7c632defe481658dd8",
+      "size_bytes": 13597299,
+      "unpacked_size_bytes": 26593336,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/task_multi_drawer_search.tar.gz"
+    },
+    {
+      "archive": "task_nuts_bolts.tar.gz",
+      "contains": [
+        "task_nuts_bolts"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 3,
+      "name": "task_nuts_bolts",
+      "sha256": "a389616fbbbf922bf6d444e472e9b95697eab5f0589b29b1a09575b1b2ba5aeb",
+      "size_bytes": 196955,
+      "unpacked_size_bytes": 753370,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/task_nuts_bolts.tar.gz"
+    },
+    {
+      "archive": "task_put_relative.tar.gz",
+      "contains": [
+        "task_put_relative"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 549,
+      "name": "task_put_relative",
+      "sha256": "0ef853c1a7a96561ec1b1ac9baa7f1ed79897656461b08c910b5ac1be140041d",
+      "size_bytes": 132663732,
+      "unpacked_size_bytes": 447836378,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/task_put_relative.tar.gz"
+    },
+    {
+      "archive": "task_water_bottles.tar.gz",
+      "contains": [
+        "task_water_bottles"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 882,
+      "name": "task_water_bottles",
+      "sha256": "a93e7d5d4fd5204b136e368af94bcc949d7a94435f19f2d14fc792e689f9c7ca",
+      "size_bytes": 41112999,
+      "unpacked_size_bytes": 188168288,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/task_water_bottles.tar.gz"
+    },
+    {
+      "archive": "tray.tar.gz",
+      "contains": [
+        "tray"
+      ],
+      "extract_dir": "abc_sim/models/assets",
+      "file_count": 22,
+      "name": "tray",
+      "sha256": "b130c04a7b72356d2336a60ab9ab68804035bbf7d8655d41d7b5f253fa715bea",
+      "size_bytes": 34840,
+      "unpacked_size_bytes": 158455,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/tray.tar.gz"
+    },
+    {
+      "archive": "assets_robocasa.tar.gz",
+      "contains": [
+        "assets_robocasa"
+      ],
+      "extract_dir": "abc_sim/models",
+      "file_count": 1,
+      "name": "assets_robocasa",
+      "sha256": "4c193e3e18bab390be7a1d014139751bbecf855e78316893070dbeb30698141e",
+      "size_bytes": 907,
+      "unpacked_size_bytes": 1445,
+      "uri": "https://abc-data.timehorizons.org/sim_assets/assets_robocasa.tar.gz"
+    }
+  ],
+  "version": "2026-08-12"
+}

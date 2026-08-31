@@ -1,31 +1,30 @@
-"""Run MuJoCo-Warp put-bottles eval for ABC-DiT checkpoints.
+"""Run MuJoCo-Warp sim eval for ABC-DiT checkpoints.
 
 Builds the scene, executes policy rollouts, and writes JSON/video outputs.
+Every task runs through the abc_sim catalogue via abc_minimal/sim_env.py.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
 import json
-import math
-import re
 import time
-import xml.etree.ElementTree as ET
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import mujoco
 import numpy as np
 import torch
 
 from abc_minimal.config import (
-    FlowConfig,
-    PutBottlesSimConfig,
     SimEvalConfig,
     validate_model_config,
 )
+from abc_sim.randomization.core import RandomizationSamplingError
 from abc_minimal.policy import DiTInferencePolicy as SimPolicy
+
+if TYPE_CHECKING:
+    from abc_minimal.sim_env import SimTaskEnv
 
 torch.set_float32_matmul_precision("high")
 
@@ -33,187 +32,6 @@ torch.set_float32_matmul_precision("high")
 # Config.
 
 ROOT = Path(__file__).resolve().parents[1]
-SCENE_XML = ROOT / "assets" / "put_bottles" / "put_bottle.xml"
-
-
-# XML helpers.
-
-
-def _fmt(values: list[float] | tuple[float, ...] | np.ndarray) -> str:
-    return " ".join(f"{float(v):.8g}" for v in values)
-
-
-def _quat_yaw(yaw: float) -> np.ndarray:
-    return np.array([math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)], dtype=np.float64)
-
-
-def _quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    aw, ax, ay, az = a
-    bw, bx, by, bz = b
-    return np.array(
-        [
-            aw * bw - ax * bx - ay * by - az * bz,
-            aw * bx + ax * bw + ay * bz - az * by,
-            aw * by - ax * bz + ay * bw + az * bx,
-            aw * bz + ax * by - ay * bx + az * bw,
-        ],
-        dtype=np.float64,
-    )
-
-
-def _flat_bottle_quat(yaw: float) -> np.ndarray:
-    flat = np.array([math.cos(math.pi / 4), 0.0, math.sin(math.pi / 4), 0.0], dtype=np.float64)
-    q = _quat_mul(_quat_yaw(yaw), flat)
-    return q / np.linalg.norm(q)
-
-
-def bottle_spawn_z(scene: PutBottlesSimConfig, index: int, scale: float = 1.0) -> float:
-    return float(
-        scene.table_z + scene.bottle_side_radii[index] * scale + scene.bottle_spawn_clearance
-    )
-
-
-def bottle_xy_footprint(
-    scene: PutBottlesSimConfig,
-    index: int,
-    scale: float,
-    yaw: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    length = float(scene.bottle_flat_lengths[index] * scale)
-    half_width = float(scene.bottle_flat_half_widths[index] * scale)
-    corners = np.array(
-        [[0.0, -half_width], [0.0, half_width], [length, -half_width], [length, half_width]],
-        dtype=np.float64,
-    )
-    c, s = math.cos(yaw), math.sin(yaw)
-    rot = np.array([[c, -s], [s, c]], dtype=np.float64)
-    offsets = corners @ rot.T
-    return offsets.min(axis=0), offsets.max(axis=0)
-
-
-def sample_bottle_pose(
-    rng: np.random.Generator,
-    scene: PutBottlesSimConfig,
-    index: int,
-    scale: float,
-    occupied: list[tuple[np.ndarray, float]],
-) -> tuple[list[float], np.ndarray, np.ndarray, float]:
-    candidate = None
-    for _ in range(scene.bottle_sample_attempts):
-        yaw = float(rng.uniform(-math.pi, math.pi))
-        xy_min, xy_max = bottle_xy_footprint(scene, index, scale, yaw)
-        table_x0, table_x1, table_y0, table_y1 = scene.table_bounds
-        x_low, x_high = table_x0 - xy_min[0], table_x1 - xy_max[0]
-        y_low, y_high = table_y0 - xy_min[1], table_y1 - xy_max[1]
-        if x_low > x_high or y_low > y_high:
-            continue
-        x = float(rng.uniform(x_low, x_high))
-        y = float(rng.uniform(y_low, y_high))
-        center = np.array([x, y], dtype=np.float64) + 0.5 * (xy_min + xy_max)
-        radius = float(0.5 * np.linalg.norm(xy_max - xy_min))
-        pos = [x, y, bottle_spawn_z(scene, index, scale)]
-        quat = _flat_bottle_quat(yaw)
-        candidate = (pos, quat, center, radius)
-        if all(
-            np.linalg.norm(center - c) > (radius + r + scene.bottle_collision_margin)
-            for c, r in occupied
-        ):
-            return candidate
-    if candidate is None:
-        raise RuntimeError("Could not sample a bottle pose inside the table bounds")
-    return candidate
-
-
-def scene_xml(scene: PutBottlesSimConfig, bottle_scales: np.ndarray, bin_scale: float) -> str:
-    root = ET.fromstring(SCENE_XML.read_text())
-    compiler = root.find("compiler")
-    if compiler is not None:
-        compiler.set("meshdir", str((ROOT / "assets" / "put_bottles" / "assets").resolve()))
-        compiler.set("texturedir", str((ROOT / "assets" / "put_bottles" / "assets").resolve()))
-    for mesh in root.findall("./asset/mesh"):
-        name = mesh.get("name", "")
-        scale = np.asarray([float(v) for v in mesh.get("scale", "1 1 1").split()], dtype=np.float64)
-        for idx in range(scene.bottle_count):
-            if name.startswith(f"bottle_{idx}_"):
-                mesh.set("scale", _fmt(scale * float(bottle_scales[idx])))
-                break
-        if name.startswith("water_bottle_"):
-            mesh.set("scale", _fmt(scale * float(bin_scale)))
-    return ET.tostring(root, encoding="unicode")
-
-
-# Environment and metrics.
-
-
-class PutBottlesEvaluator:
-    def __init__(self, model: mujoco.MjModel, scene: PutBottlesSimConfig):
-        self.model = model
-        self.scene = scene
-        self.bottle_names, self.bottle_qpos_addrs = self._bottle_addrs()
-        self.bin_qpos_adr = self._joint_qpos_adr("bin_joint")
-        self.max_bottles = 0
-        self.ever_success = False
-
-    def reset(self) -> None:
-        self.max_bottles = 0
-        self.ever_success = False
-
-    def _joint_qpos_adr(self, name: str) -> int:
-        joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
-        if joint_id < 0:
-            raise ValueError(f"Joint not found: {name}")
-        return int(self.model.jnt_qposadr[joint_id])
-
-    def _bottle_addrs(self) -> tuple[list[str], np.ndarray]:
-        entries = []
-        for joint_id in range(self.model.njnt):
-            name = self.model.jnt(joint_id).name
-            match = re.fullmatch(r"bottle_(\d+)_joint", name or "")
-            if match:
-                idx = int(match.group(1))
-                entries.append((idx, f"bottle_{idx}", int(self.model.jnt_qposadr[joint_id])))
-        entries.sort()
-        return [e[1] for e in entries], np.asarray([e[2] for e in entries], dtype=np.int32)
-
-    def evaluate(self, qpos: np.ndarray) -> dict[str, Any]:
-        qpos = np.asarray(qpos, dtype=np.float32)
-        bin_pos = qpos[self.bin_qpos_adr : self.bin_qpos_adr + 3]
-        bottle_pos = np.stack([qpos[adr : adr + 3] for adr in self.bottle_qpos_addrs])
-        rel = bottle_pos - bin_pos[None]
-        radial = np.linalg.norm(rel[:, :2], axis=1)
-        radial_margin = self.scene.eval_bin_radius - radial
-        lower_height_margin = rel[:, 2] - self.scene.eval_min_rel_z
-        upper_height_margin = self.scene.eval_max_rel_z - rel[:, 2]
-        in_bin = (radial_margin >= 0.0) & (lower_height_margin >= 0.0) & (upper_height_margin >= 0.0)
-        num = int(in_bin.sum())
-        active = len(self.bottle_names)
-        self.max_bottles = max(self.max_bottles, num)
-        success = num == active
-        self.ever_success = self.ever_success or success
-        return {
-            "reward": float(num / max(active, 1)),
-            "success": bool(success),
-            "ever_success": bool(self.ever_success),
-            "num_bottles_in_bin": num,
-            "num_active_bottles": active,
-            "max_bottles_in_bin_so_far": int(self.max_bottles),
-            "bottle_in_bin_mask": [bool(x) for x in in_bin.tolist()],
-            "bottles_in_bin": [name for name, ok in zip(self.bottle_names, in_bin) if bool(ok)],
-            "bottle_names": list(self.bottle_names),
-            "success_count": active,
-            "closest_radial_margin": float(radial_margin.max()),
-            "closest_height_margin": float(lower_height_margin.max()),
-            "closest_upper_height_margin": float(upper_height_margin.max()),
-        }
-
-
-@dataclass
-class Randomization:
-    seed: int
-    bottle_states: dict[str, dict[str, list[float]]]
-    bin_state: dict[str, list[float]]
-    bottle_scales: list[float]
-    bin_scale: float
 
 
 def require_mjwarp() -> None:
@@ -227,272 +45,7 @@ def require_mjwarp() -> None:
         ) from exc
 
 
-class MJWarpSim:
-    def __init__(self, model: mujoco.MjModel, data: mujoco.MjData, *, height: int, width: int, gpu_id: int | None):
-        require_mjwarp()
-        import mujoco_warp as mjw
-        import warp as wp
-
-        self.mjw = mjw
-        self.wp = wp
-        self.model = model
-        self.data = data
-        self.height = height
-        self.width = width
-        self.nworld = 1
-        if gpu_id is not None:
-            wp.set_device(f"cuda:{gpu_id}")
-        self.m_warp = mjw.put_model(model)
-        self.d_warp = mjw.put_data(model, data, nworld=self.nworld, nconmax=model.nconmax, njmax=model.njmax)
-        self.render_context = mjw.create_render_context(
-            mjm=model,
-            nworld=self.nworld,
-            cam_res=(width, height),
-            render_rgb=[True] * model.ncam,
-            render_depth=[False] * model.ncam,
-            use_textures=True,
-            use_shadows=True,
-        )
-        self.closed = False
-
-    def close(self) -> None:
-        if self.closed:
-            return
-        try:
-            self.wp.synchronize()
-        except Exception:
-            pass
-        self.render_context = None
-        self.m_warp = None
-        self.d_warp = None
-        self.model = None
-        self.data = None
-        self.closed = True
-
-    def _copy(self, target: Any, values: np.ndarray, dtype: Any) -> None:
-        self.wp.copy(target, self.wp.from_numpy(np.asarray(values), dtype=dtype))
-
-    def load_state(self) -> None:
-        self.mjw.reset_data(self.m_warp, self.d_warp)
-        self._copy(self.d_warp.qpos, np.asarray(self.data.qpos, dtype=np.float32)[None], self.wp.float32)
-        if self.model.nv > 0:
-            self._copy(self.d_warp.qvel, np.asarray(self.data.qvel, dtype=np.float32)[None], self.wp.float32)
-        if self.model.nu > 0:
-            self._copy(self.d_warp.ctrl, np.asarray(self.data.ctrl, dtype=np.float32)[None], self.wp.float32)
-        if self.model.na > 0 and hasattr(self.d_warp, "act"):
-            self._copy(self.d_warp.act, np.asarray(self.data.act, dtype=np.float32)[None], self.wp.float32)
-        if self.model.nmocap > 0:
-            self._copy(self.d_warp.mocap_pos, np.asarray(self.data.mocap_pos, dtype=np.float32)[None], self.wp.vec3f)
-            self._copy(self.d_warp.mocap_quat, np.asarray(self.data.mocap_quat, dtype=np.float32)[None], self.wp.quatf)
-        if hasattr(self.d_warp, "time"):
-            self._copy(self.d_warp.time, np.asarray([self.data.time], dtype=np.float32), self.wp.float32)
-
-    def forward(self) -> None:
-        self.mjw.forward(self.m_warp, self.d_warp)
-
-    def qpos(self) -> np.ndarray:
-        return self.d_warp.qpos.numpy()[0].copy()
-
-    def set_ctrl(self, ctrl: np.ndarray) -> None:
-        ctrl = np.asarray(ctrl, dtype=np.float32)
-        if ctrl.shape != (self.model.nu,):
-            raise ValueError(f"Expected ctrl shape {(self.model.nu,)}, got {ctrl.shape}")
-        self._copy(self.d_warp.ctrl, ctrl[None], self.wp.float32)
-
-    def step(self, nstep: int) -> None:
-        for _ in range(nstep):
-            self.mjw.step(self.m_warp, self.d_warp)
-
-    def render(self) -> np.ndarray:
-        self.mjw.refit_bvh(self.m_warp, self.d_warp, self.render_context)
-        self.mjw.render(self.m_warp, self.d_warp, self.render_context)
-        rgba = self.render_context.rgb_data.numpy().view(np.uint8).reshape(
-            self.nworld,
-            self.model.ncam,
-            self.height,
-            self.width,
-            4,
-        )
-        return rgba[0, :, :, :, :3][..., ::-1].copy()
-
-
-class PutBottlesEnv:
-    def __init__(
-        self,
-        *,
-        height: int,
-        width: int,
-        camera_keys: tuple[str, ...],
-        prompt: str,
-        scene: PutBottlesSimConfig,
-        gpu_id: int | None = None,
-    ):
-        self.scene = scene
-        self.height = height
-        self.width = width
-        self.camera_keys = tuple(camera_keys)
-        self.prompt = prompt
-        self.control_decimation = scene.control_decimation
-        self.gpu_id = gpu_id
-        self.sim = None
-        self.model = None
-        self.data = None
-        self.evaluator = None
-        self.qpos_indices: list[int] = []
-        self.ctrl_indices: list[int] = []
-        self.gripper_state_indices: set[int] = set()
-        self.randomization = None
-
-    def close(self) -> None:
-        if self.sim is not None:
-            self.sim.close()
-            self.sim = None
-
-    def _bind(self, xml: str) -> None:
-        self.close()
-        self.model = mujoco.MjModel.from_xml_string(xml)
-        self.model.opt.timestep = self.scene.timestep
-        self.data = mujoco.MjData(self.model)
-        self.sim = MJWarpSim(self.model, self.data, height=self.height, width=self.width, gpu_id=self.gpu_id)
-        self.evaluator = PutBottlesEvaluator(self.model, self.scene)
-        self.qpos_indices, self.ctrl_indices, self.gripper_state_indices = [], [], set()
-        idx = 0
-        for robot in ("left", "right"):
-            for j in range(1, 7):
-                jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, f"{robot}_joint{j}")
-                aid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"{robot}_joint{j}")
-                self.qpos_indices.append(int(self.model.jnt_qposadr[jid]))
-                self.ctrl_indices.append(aid)
-                idx += 1
-            jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, f"{robot}_left_finger")
-            aid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"{robot}_gripper")
-            self.qpos_indices.append(int(self.model.jnt_qposadr[jid]))
-            self.ctrl_indices.append(aid)
-            self.gripper_state_indices.add(idx)
-            idx += 1
-
-    def reset(self, seed: int) -> dict[str, Any]:
-        rng = np.random.default_rng(seed)
-        scene = self.scene
-        bottle_scales = rng.uniform(*scene.bottle_scale_range, size=scene.bottle_count).astype(np.float32)
-        bin_scale = float(rng.uniform(*scene.bin_scale_range))
-        self._bind(scene_xml(scene, bottle_scales, bin_scale))
-        mujoco.mj_resetData(self.model, self.data)
-        self._set_state(np.asarray(scene.init_q, dtype=np.float32))
-
-        bin_yaw = float(rng.uniform(*scene.bin_yaw_range))
-        bin_x0, bin_x1, bin_y0, bin_y1 = scene.bin_xy_range
-        bin_pos = [
-            float(rng.uniform(bin_x0, bin_x1)),
-            float(rng.uniform(bin_y0, bin_y1)),
-            float(scene.bin_z_scale * bin_scale),
-        ]
-        bin_quat = _quat_mul(_quat_yaw(bin_yaw), np.asarray(scene.bin_base_quat, dtype=np.float64))
-        self._set_freejoint("bin_joint", bin_pos, bin_quat.tolist())
-
-        occupied: list[tuple[np.ndarray, float]] = [
-            (np.asarray(bin_pos[:2]), scene.bin_occupied_radius * bin_scale)
-        ]
-        bottle_states = {}
-        for index in range(scene.bottle_count):
-            pos, q, center, radius = sample_bottle_pose(
-                rng, scene, index, float(bottle_scales[index]), occupied
-            )
-            name = f"bottle_{index + 1}_joint"
-            self._set_freejoint(name, pos, q.tolist())
-            bottle_states[name] = {"pos": pos, "quat": q.tolist(), "scale": [float(bottle_scales[index])]}
-            occupied.append((center, radius))
-
-        mujoco.mj_forward(self.model, self.data)
-        self.sim.load_state()
-        self.sim.forward()
-        self.evaluator.reset()
-        self.randomization = Randomization(
-            seed=seed,
-            bottle_states=bottle_states,
-            bin_state={"pos": bin_pos, "quat": bin_quat.tolist(), "yaw": [bin_yaw]},
-            bottle_scales=bottle_scales.tolist(),
-            bin_scale=bin_scale,
-        )
-        return self.obs()
-
-    def _set_freejoint(self, name: str, pos: list[float], quat: list[float]) -> None:
-        jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
-        adr = int(self.model.jnt_qposadr[jid])
-        self.data.qpos[adr : adr + 3] = pos
-        self.data.qpos[adr + 3 : adr + 7] = quat
-
-    def _set_state(self, state: np.ndarray) -> None:
-        for i, qpos_idx in enumerate(self.qpos_indices):
-            val = float(state[i])
-            if i in self.gripper_state_indices:
-                val *= self.scene.gripper_ctrl_max
-            self.data.qpos[qpos_idx] = val
-
-    def get_state(self) -> np.ndarray:
-        state = np.asarray(self.sim.qpos()[self.qpos_indices], dtype=np.float32)
-        for i in self.gripper_state_indices:
-            state[i] = np.clip(state[i] / self.scene.gripper_ctrl_max, 0.0, 1.0)
-        return state
-
-    def render_cameras(self) -> dict[str, np.ndarray]:
-        rgb = self.sim.render()
-        images = {}
-        for name in self.camera_keys:
-            cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, name)
-            if cam_id < 0:
-                raise ValueError(f"Camera not found: {name}")
-            images[name] = rgb[cam_id].transpose(2, 0, 1).copy()
-        return images
-
-    def obs(self) -> dict[str, Any]:
-        return {"state": self.get_state(), "images": self.render_cameras(), "prompt": self.prompt}
-
-    def action_to_ctrl(self, action: np.ndarray) -> np.ndarray:
-        ctrl = np.zeros(self.model.nu, dtype=np.float32)
-        for i, act_id in enumerate(self.ctrl_indices):
-            val = float(action[i])
-            if i in self.gripper_state_indices:
-                val *= self.scene.gripper_ctrl_max
-            ctrl[act_id] = val
-        return ctrl
-
-    def step_one(self, action: np.ndarray) -> None:
-        ctrl = self.action_to_ctrl(action)
-        self.sim.set_ctrl(ctrl)
-        self.sim.step(self.control_decimation)
-
-    def evaluate(self) -> dict[str, Any]:
-        return self.evaluator.evaluate(self.sim.qpos())
-
-    def step_one_vanilla(self, action: np.ndarray) -> None:
-        self.data.ctrl[:] = self.action_to_ctrl(action)
-        for _ in range(self.control_decimation):
-            mujoco.mj_step(self.model, self.data)
-
-    def evaluate_vanilla(self) -> dict[str, Any]:
-        return self.evaluator.evaluate(np.asarray(self.data.qpos, dtype=np.float32))
-
-    def get_state_vanilla(self) -> np.ndarray:
-        state = np.asarray(self.data.qpos[self.qpos_indices], dtype=np.float32)
-        for i in self.gripper_state_indices:
-            state[i] = np.clip(state[i] / self.scene.gripper_ctrl_max, 0.0, 1.0)
-        return state
-
-    def render_cameras_vanilla_state(self) -> dict[str, np.ndarray]:
-        self.sim.load_state()
-        self.sim.forward()
-        return self.render_cameras()
-
-    def obs_vanilla_state(self) -> dict[str, Any]:
-        return {
-            "state": self.get_state_vanilla(),
-            "images": self.render_cameras_vanilla_state(),
-            "prompt": self.prompt,
-        }
-
-
-class _RTCManager:
+class RTCManager:
     def __init__(
         self,
         policy: "SimPolicy",
@@ -572,6 +125,110 @@ def jsonable(x: Any) -> Any:
     return x
 
 
+def _optional_int(value: Any) -> int | None:
+    return None if value is None else int(value)
+
+
+# Chunk-metric fields that only exist for a task whose evaluator counts bottles.
+CHUNK_COUNT_KEYS = ("bottles", "max_bottles")
+
+
+def without_missing_counts(metric: dict[str, Any]) -> dict[str, Any]:
+    """A chunk metric without the bottle counters the task does not have.
+
+    build_summary leaves ``mean_max_bottles_in_bin`` out entirely rather than
+    reporting null for a task with no such evaluator, and the per-chunk counters
+    follow it: a consumer can ask ``"bottles" in metric`` instead of having to
+    know that the key is present but null on every other task.
+    """
+    return {
+        key: value
+        for key, value in metric.items()
+        if value is not None or key not in CHUNK_COUNT_KEYS
+    }
+
+
+def resolve_prefix_length(config: SimEvalConfig, trained_max_prefix: int) -> int:
+    """Effective synchronous prefix length for the sequential loop (0 = off).
+
+    Needs the checkpoint's trained max, so this runs after loading rather than
+    in the static config validation.
+    """
+    # max_action_prefix is an exclusive sampling bound (randint(0, max)), so
+    # the longest prefix training ever produced is max - 1.
+    longest_trained = max(0, trained_max_prefix - 1)
+    if config.rtc:
+        # RTC builds its own prefixes; cap them to the checkpoint's trained
+        # range here for the same post-load reason (a checkpoint trained with
+        # a short max_action_prefix would otherwise reject the default).
+        if config.rtc_prefix_length > longest_trained:
+            capped = max(0, longest_trained)
+            print(
+                f"[prefix] rtc_prefix_length {config.rtc_prefix_length} -> "
+                f"{capped} (checkpoint trained max_action_prefix="
+                f"{trained_max_prefix}, exclusive bound)"
+            )
+            config.rtc_prefix_length = capped
+        return 0
+    length = config.prefix_length
+    if length is None:
+        # Unprefixed is the synchronous default: the sync loop's prefix feeds
+        # already-executed actions into a committed-future interface, which
+        # correctly-labeled (v3) checkpoints take literally. Pass an explicit
+        # --prefix-length (production used 5) to reproduce historical
+        # synchronous numbers.
+        length = 0
+    if length == 0:
+        return 0
+    errors = []
+    if length < 0:
+        errors.append(f"prefix_length must be >= 0, got {length}")
+    if length > longest_trained:
+        errors.append(
+            f"prefix_length ({length}) exceeds the longest trained prefix "
+            f"({longest_trained}; the checkpoint's max_action_prefix bound of "
+            f"{trained_max_prefix} is exclusive)"
+        )
+    if length > config.execute_chunk_dim:
+        errors.append(
+            f"prefix_length ({length}) must be <= execute_chunk_dim "
+            f"({config.execute_chunk_dim}) so executed actions can seed the next prefix"
+        )
+    if length + config.execute_chunk_dim > config.model.chunk_length:
+        errors.append(
+            f"prefix_length + execute_chunk_dim ({length} + {config.execute_chunk_dim}) "
+            f"must be <= chunk_length ({config.model.chunk_length})"
+        )
+    if errors:
+        raise ValueError("Invalid prefix config:\n  - " + "\n  - ".join(errors))
+    return length
+
+
+def rollout_over(task_eval: dict[str, Any]) -> bool:
+    """Whether a rollout has nothing left to do and can stop before its budget.
+
+    For most tasks that is the first success: once the bottles are in the bin,
+    stepping on only burns wall clock. A maintenance task is the other way round
+    -- ball_tray_balancing reports ``ever_failed`` and defines ``ever_success``
+    as "has not dropped the ball yet", so it is already succeeding at reset and
+    is over only once it fails. Stopping such a task on ``ever_success`` ends it
+    on step one and scores a 15-second balance on a single simulator step, so
+    ``ever_failed`` is the signal when the evaluator reports one.
+    """
+    if "ever_failed" in task_eval:
+        return bool(task_eval["ever_failed"])
+    return bool(task_eval["ever_success"])
+
+
+def progress_text(task_eval: dict[str, Any], bottles_key: str) -> str:
+    """Progress for one rollout: the bottles counter, or reward for other tasks."""
+    count = task_eval.get(bottles_key)
+    if count is None:
+        return f"reward={float(task_eval.get('reward', 0.0)):.2f}"
+    total = task_eval.get("num_active_bottles", task_eval.get("success_count"))
+    return f"bottles={count}/{total}"
+
+
 def video_frame(images: dict[str, np.ndarray], camera_keys: tuple[str, ...]) -> np.ndarray:
     frames = []
     for name in camera_keys:
@@ -580,9 +237,14 @@ def video_frame(images: dict[str, np.ndarray], camera_keys: tuple[str, ...]) -> 
     return np.concatenate(frames, axis=1)
 
 
-def resolve_device(device: str) -> str:
+def resolve_device(device: str, gpu_id: int | None = None) -> str:
     if device == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    # The renderer pins itself to cuda:{gpu_id}; a bare "cuda"
+    # policy device means cuda:0, so --gpu-id N != 0 split policy and renderer
+    # across devices and crashed mid-rollout. Pin the policy alongside.
+    if gpu_id is not None and device == "cuda":
+        return f"cuda:{gpu_id}"
     return device
 
 
@@ -590,18 +252,189 @@ def validate_rtc_config(config: SimEvalConfig) -> list[str]:
     if not config.rtc:
         return []
     errors = []
-    trained_max_prefix = FlowConfig().max_action_prefix
-    if not 0 < config.rtc_prefix_length <= trained_max_prefix:
+    # The upper bound is the checkpoint's trained prefix range, which is
+    # only known after loading; resolve_prefix_length enforces it there.
+    if config.rtc_prefix_length < 1:
+        errors.append("rtc_prefix_length must be >= 1")
+    if config.prefix_length:
         errors.append(
-            f"rtc_prefix_length must be in [1, {trained_max_prefix}] for this checkpoint"
+            "--prefix-length is ignored under --rtc, which builds its own "
+            "prefixes; pass --prefix-length 0 or drop one of the flags"
         )
-    if config.rtc_prefix_length > config.rtc_inference_lead_steps:
-        errors.append("rtc_prefix_length must be <= rtc_inference_lead_steps")
+    if config.rtc_prefix_length != config.rtc_inference_lead_steps:
+        errors.append("rtc_prefix_length must equal rtc_inference_lead_steps")
     if config.rtc_inference_lead_steps > config.execute_chunk_dim:
         errors.append("rtc_inference_lead_steps must be <= execute_chunk_dim")
     if config.rtc and config.save_video:
-        errors.append("RTC eval does not support --save-video; video rendering hides the overlap")
+        # Rollouts are unaffected (rtc.get() joins blockingly; the executed
+        # action sequence never depends on wall time), but per-action rendering
+        # inflates steps_s, so the overlap telemetry in chunk_metrics
+        # (infer_s vs steps_s, rtc_ready) stops being meaningful.
+        print(
+            "[warn] --save-video under --rtc: scores are unaffected, but the "
+            "chunk timing/overlap telemetry includes render time"
+        )
     return errors
+
+
+def checkpoint_sim_prompt(config: SimEvalConfig) -> str | None:
+    """The prompt this checkpoint trained ``config.task`` under, or None.
+
+    Published checkpoints ship a ``<stem>.json`` metadata sidecar whose
+    ``sim_prompt_map`` records, per task, the prompt its episodes actually
+    carried in the training mixture. That is not always the prompt the abc_sim
+    spec generates: the mixtures remap their sim task names, and prompts are
+    derived from the name after the remap. Prompting a flow policy
+    off-distribution costs success silently, with no error to trace it to, so
+    the map is read back rather than left to the docs.
+    """
+    sidecar = Path(config.checkpoint).with_suffix(".json")
+    if not sidecar.exists():
+        return None
+    try:
+        prompt_map = json.loads(sidecar.read_text())["sim_prompt_map"]
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"[prompt] ignoring unusable sidecar {sidecar.name}: {exc!r}")
+        return None
+    from abc_sim import maybe_get_task_spec
+
+    spec = maybe_get_task_spec(config.task)
+    return prompt_map.get(spec.name) if spec else None
+
+
+def resolve_prompt(config: SimEvalConfig) -> str:
+    """Prompt to condition on: --prompt if given, else the prompt the checkpoint
+    trained this task under, else the task's sim prompt."""
+    if config.prompt is not None:
+        return config.prompt
+    # Deliberately ahead of the task-spec fallback: the 200k policy's sidecar
+    # maps put_plastic_bottles_in_bin to the throw prompt it actually trained
+    # that scene under, and corrects it here. The throw scene (--task bottles)
+    # is absent from that map, having been left out of the mixture, so it falls
+    # through to its own spec prompt, already correct.
+    trained = checkpoint_sim_prompt(config)
+    if trained is not None:
+        print(f"[prompt] {trained!r} (the prompt this checkpoint trained the task under)")
+        return trained
+    from abc_minimal.sim_env import task_prompt
+
+    return task_prompt(config.task)
+
+
+def resolve_output_dir(config: SimEvalConfig) -> str:
+    """Output directory: --output-dir if given, else one named after the task."""
+    if config.output_dir is not None:
+        return config.output_dir
+    return str(ROOT / "outputs" / f"sim_eval_{config.task}")
+
+
+def _make_env(config: SimEvalConfig) -> "SimTaskEnv":
+    """Build the rollout env for the configured task (abc_sim catalogue)."""
+    from abc_minimal.sim_env import SimTaskEnv
+
+    return SimTaskEnv(
+        task=config.task,
+        height=config.camera_height,
+        width=config.camera_width,
+        camera_keys=config.model.camera_keys,
+        prompt=config.prompt,
+        camera_backend=config.camera_backend,
+        gpu_id=config.gpu_id,
+    )
+
+
+def resolved_physics(env: Any) -> dict[str, Any] | None:
+    """The physics the env actually steps with, read off the live objects.
+
+    ``summary["config"]`` echoes the *requested* physics, but scene tasks can
+    override physics_dt/control_decimation at env construction
+    (task_registry physics_defaults) — the 181.8 Hz pour eval bug shipped
+    summaries claiming 29.4 Hz.
+    """
+    for obj in (env, getattr(env, "env", None)):
+        if obj is None:
+            continue
+        dec = getattr(obj, "control_decimation", None)
+        if dec is None:
+            dec = getattr(obj, "_control_decimation", None)
+        model = getattr(obj, "model", None)
+        dt = getattr(getattr(model, "opt", None), "timestep", None)
+        if dt is None:
+            dt = getattr(obj, "_physics_dt", None)
+        if dec is not None and dt is not None:
+            dt = float(dt)
+            dec = int(dec)
+            return {
+                "physics_dt": dt,
+                "control_decimation": dec,
+                "control_hz": 1.0 / (dt * dec),
+            }
+    return None
+
+
+def build_summary(
+    *,
+    config: SimEvalConfig,
+    ckpt_path: Path,
+    device: str,
+    worlds: list[dict[str, Any]],
+    out_dir: Path,
+    physics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Aggregate per-world records, write summary.json, and print the tail lines."""
+    success = np.asarray([w["success"] for w in worlds], dtype=bool)
+    rewards = np.asarray([w["reward"] for w in worlds], dtype=np.float32)
+    per_world_max_bottles = [
+        w["final_task_eval"].get("max_bottles_in_bin_so_far") for w in worlds
+    ]
+    has_bottles_metric = all(value is not None for value in per_world_max_bottles)
+    per_world_max_reward = [w.get("max_reward") for w in worlds]
+    has_max_reward = all(value is not None for value in per_world_max_reward)
+    summary = {
+        "format": "abc_minimal_sim_eval/v1",
+        "checkpoint": str(ckpt_path),
+        "prompt": config.prompt,
+        "config": asdict(config),
+        "resolved_device": device,
+        "success_rate": float(success.mean()) if success.size else None,
+        "num_success": int(success.sum()),
+        "num_worlds": len(worlds),
+        "mean_reward": float(rewards.mean()) if rewards.size else None,
+        "worlds": worlds,
+    }
+    summary["task"] = config.task
+    if physics is not None:
+        summary["resolved_physics"] = physics
+    if has_max_reward:
+        # Mean over worlds of the best instantaneous progress fraction — the
+        # statistic the production dishrack eval (and the paper's "sim
+        # progress" plots) aggregated. mean_reward stays the final-step value.
+        max_rewards = np.asarray(per_world_max_reward, dtype=np.float32)
+        summary["mean_max_progress"] = (
+            float(max_rewards.mean()) if max_rewards.size else None
+        )
+    if has_bottles_metric:
+        max_bottles = np.asarray(per_world_max_bottles, dtype=np.float32)
+        summary["mean_max_bottles_in_bin"] = (
+            float(max_bottles.mean()) if max_bottles.size else None
+        )
+    (out_dir / "summary.json").write_text(json.dumps(jsonable(summary), indent=2, sort_keys=True))
+    progress_text_part = (
+        f" mean_max_progress={summary['mean_max_progress']}" if has_max_reward else ""
+    )
+    bottles_text = (
+        f" mean_max_bottles={summary['mean_max_bottles_in_bin']}"
+        if has_bottles_metric
+        else ""
+    )
+    print(
+        f"summary: success_rate={summary['success_rate']} "
+        f"num_success={summary['num_success']}/{summary['num_worlds']} "
+        f"mean_reward={summary['mean_reward']}{progress_text_part}{bottles_text}",
+        flush=True,
+    )
+    print(f"wrote {out_dir / 'summary.json'}", flush=True)
+    return summary
 
 
 def run_eval(config: SimEvalConfig) -> dict[str, Any]:
@@ -611,22 +444,41 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
         raise ValueError("Invalid sim eval config:\n  - " + "\n  - ".join(config_errors))
 
     require_mjwarp()
-    ckpt_path = Path(config.checkpoint).expanduser().resolve()
-    device = resolve_device(config.device)
-    policy = SimPolicy(ckpt_path, config, device)
-    env = PutBottlesEnv(
-        height=config.camera_height,
-        width=config.camera_width,
-        camera_keys=config.model.camera_keys,
-        prompt=config.prompt,
-        scene=config.scene,
-        gpu_id=config.gpu_id,
+    config = replace(
+        config,
+        prompt=resolve_prompt(config),
+        output_dir=resolve_output_dir(config),
     )
+    ckpt_path = Path(config.checkpoint).expanduser().resolve()
+    device = resolve_device(config.device, config.gpu_id)
+    policy = SimPolicy(ckpt_path, config, device)
+    prefix_length = resolve_prefix_length(config, policy.trained_max_prefix)
+    config = replace(config, prefix_length=prefix_length)
+    prefix_text = (
+        f"conditioning on the last {prefix_length} executed actions"
+        if prefix_length
+        else "unprefixed (off-distribution for prefix-trained checkpoints)"
+    )
+    print(
+        f"prefix conditioning: {prefix_text} "
+        f"(checkpoint max_action_prefix={policy.trained_max_prefix})",
+        flush=True,
+    )
+    env = _make_env(config)
+    physics = resolved_physics(env)
+    if physics is not None:
+        print(
+            f"[physics] dt={physics['physics_dt']} "
+            f"decimation={physics['control_decimation']} "
+            f"control={physics['control_hz']:.2f}Hz",
+            flush=True,
+        )
     rng = np.random.default_rng(config.policy_seed)
     worlds = []
     out_dir = Path(config.output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     fast_inference_ready = False
+    rtc_warmup_ready = False
     action_shape = (config.model.chunk_length, config.model.action_dim)
 
     def sample_noise(generator: np.random.Generator) -> np.ndarray:
@@ -638,7 +490,21 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
             video_path = None
             t0 = time.perf_counter()
             seed = int(config.seed + world_index)
-            obs = env.reset(seed=seed)
+            try:
+                obs = env.reset(seed=seed)
+            except RandomizationSamplingError:
+                # The carried arm pose from the previous episode can block a
+                # seed that places fine from init_q; retry from init_q before
+                # resampling so the run keeps its world count.
+                env.forget_arm_state()
+                try:
+                    obs = env.reset(seed=seed)
+                    print(f"world={world_index:03d} unplaceable from the carried "
+                          "arm pose, placed from init_q")
+                except RandomizationSamplingError:
+                    seed = int(config.seed + world_index + 100_000)
+                    print(f"world={world_index:03d} unplaceable seed, resampled -> {seed}")
+                    obs = env.reset(seed=seed)
             if config.fast_inference and not fast_inference_ready:
                 warmup_rng = np.random.default_rng(config.policy_seed)
                 warmup_noise = sample_noise(warmup_rng)
@@ -653,6 +519,18 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
                     f"fast inference ready in {time.perf_counter() - t_fast:.1f}s",
                     flush=True,
                 )
+                if prefix_length:
+                    # Same prefix-conditioned graph RTC uses, replayed
+                    # synchronously here. The plain graph captured above will
+                    # never be replayed on this run (every infer carries a
+                    # prefix), but warmup_rtc requires it as its capture gate.
+                    t_prefix = time.perf_counter()
+                    policy.warmup_rtc(obs, warmup_noise, prefix_length)
+                    print(
+                        f"prefix-conditioned inference (length {prefix_length}) "
+                        f"ready in {time.perf_counter() - t_prefix:.1f}s",
+                        flush=True,
+                    )
                 fast_inference_ready = True
             if config.save_video:
                 import imageio.v2 as imageio
@@ -661,6 +539,9 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
                 video = imageio.get_writer(str(video_path), fps=config.video_fps, macro_block_size=1)
                 video.append_data(video_frame(obs["images"], config.model.camera_keys))
             final_eval = env.evaluate_vanilla() if config.vanilla_physics else env.evaluate()
+            # Best instantaneous progress fraction over the episode; the
+            # production dishrack eval aggregated this, not the final state.
+            max_reward = float(final_eval.get("reward", 0.0))
             steps = 0
             chunk_metrics = []
             rtc = None
@@ -673,20 +554,35 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
                     if config.vanilla_physics
                     else env.render_cameras
                 )
+                action_prefix = None
+                if prefix_length:
+                    # No actions executed yet: condition the first chunk on the
+                    # current state tiled, the production harness convention.
+                    action_prefix = np.tile(
+                        np.asarray(obs["state"], dtype=np.float32)[None, :],
+                        (prefix_length, 1),
+                    )
                 noise = sample_noise(rng)
                 t_infer = time.perf_counter()
-                actions = policy.infer(obs, noise=noise)
+                actions = policy.infer(
+                    obs,
+                    noise=noise,
+                    action_prefix=action_prefix,
+                    prefix_length=prefix_length,
+                )
                 current_infer_s = time.perf_counter() - t_infer
                 if config.rtc:
-                    rtc_warmup_rng = np.random.default_rng(config.policy_seed)
-                    warmup_noise = sample_noise(rtc_warmup_rng)
-                    t_rtc_warm = time.perf_counter()
-                    policy.warmup_rtc(obs, warmup_noise, config.rtc_prefix_length)
-                    print(
-                        f"rtc inference ready in {time.perf_counter() - t_rtc_warm:.1f}s",
-                        flush=True,
-                    )
-                    rtc = _RTCManager(
+                    if not rtc_warmup_ready:
+                        rtc_warmup_rng = np.random.default_rng(config.policy_seed)
+                        warmup_noise = sample_noise(rtc_warmup_rng)
+                        t_rtc_warm = time.perf_counter()
+                        policy.warmup_rtc(obs, warmup_noise, config.rtc_prefix_length)
+                        print(
+                            f"rtc inference ready in {time.perf_counter() - t_rtc_warm:.1f}s",
+                            flush=True,
+                        )
+                        rtc_warmup_ready = True
+                    rtc = RTCManager(
                         policy,
                         prefix_length=config.rtc_prefix_length,
                         inference_lead_steps=config.rtc_inference_lead_steps,
@@ -701,7 +597,12 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
                     rtc_infer_s = None
                     rtc_obs_s = 0.0
                     lead_index = config.execute_chunk_dim - config.rtc_inference_lead_steps
-                    for action_index, action in enumerate(actions[: config.execute_chunk_dim]):
+                    # The first prefix_length positions of a prefixed chunk
+                    # reconstruct actions that were already executed; skip them.
+                    executed = actions[
+                        prefix_length : prefix_length + config.execute_chunk_dim
+                    ]
+                    for action_index, action in enumerate(executed):
                         if (
                             rtc is not None
                             and chunk + 1 < config.num_chunks
@@ -715,21 +616,31 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
                             rtc_started = True
                         step_fn(action)
                         final_eval = eval_fn()
+                        max_reward = max(max_reward, float(final_eval.get("reward", 0.0)))
                         steps += 1
                         if video is not None and steps % config.video_every_n_actions == 0:
                             video.append_data(video_frame(render_fn(), config.model.camera_keys))
-                        if final_eval["ever_success"]:
+                        if rollout_over(final_eval):
                             break
                     steps_s = time.perf_counter() - t_steps
-                    if final_eval["ever_success"]:
+                    if rollout_over(final_eval):
                         break
                     if rtc is None and chunk + 1 < config.num_chunks:
                         t_obs = time.perf_counter()
                         obs = obs_fn()
                         rtc_obs_s = time.perf_counter() - t_obs
+                        if prefix_length:
+                            action_prefix = np.asarray(
+                                executed[-prefix_length:], dtype=np.float32
+                            )
                         noise = sample_noise(rng)
                         t_infer = time.perf_counter()
-                        actions = policy.infer(obs, noise=noise)
+                        actions = policy.infer(
+                            obs,
+                            noise=noise,
+                            action_prefix=action_prefix,
+                            prefix_length=prefix_length,
+                        )
                         current_infer_s = time.perf_counter() - t_infer
                     elif rtc_started:
                         actions, rtc_infer_s, rtc_ready = rtc.get()
@@ -746,10 +657,13 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
                         "obs_render_s": float(rtc_obs_s),
                         "wall_s": float(time.perf_counter() - t_chunk),
                         "rtc_ready_at_chunk_end": rtc_ready,
-                        "bottles": int(final_eval["num_bottles_in_bin"]),
-                        "max_bottles": int(final_eval["max_bottles_in_bin_so_far"]),
+                        "reward": float(final_eval.get("reward", 0.0)),
+                        "bottles": _optional_int(final_eval.get("num_bottles_in_bin")),
+                        "max_bottles": _optional_int(
+                            final_eval.get("max_bottles_in_bin_so_far")
+                        ),
                     }
-                    chunk_metrics.append(metric)
+                    chunk_metrics.append(without_missing_counts(metric))
                     if config.log_every_chunk:
                         rtc_text = (
                             f" rtc_ready_at_chunk_end={rtc_ready}"
@@ -761,8 +675,8 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
                             f"infer={metric['infer_s'] * 1000:.0f}ms "
                             f"steps={metric['steps_s'] * 1000:.0f}ms "
                             f"render={metric['obs_render_s'] * 1000:.0f}ms "
-                            f"bottles={final_eval['num_bottles_in_bin']}/{final_eval['num_active_bottles']} "
-                            f"success={final_eval['ever_success']}{rtc_text}",
+                            f"{progress_text(final_eval, 'num_bottles_in_bin')} "
+                            f"done={rollout_over(final_eval)}{rtc_text}",
                             flush=True,
                         )
             finally:
@@ -777,6 +691,7 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
                 "success": bool(final_eval["ever_success"]),
                 "final_success": bool(final_eval["success"]),
                 "reward": float(final_eval["reward"]),
+                "max_reward": float(max_reward),
                 "steps": steps,
                 "wall_s": time.perf_counter() - t0,
                 "chunk_metrics": chunk_metrics,
@@ -787,42 +702,21 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
             worlds.append(world)
             print(
                 f"world={world_index:03d} done success={world['success']} "
-                f"bottles={final_eval['max_bottles_in_bin_so_far']}/{final_eval['num_active_bottles']} "
+                f"{progress_text(final_eval, 'max_bottles_in_bin_so_far')} "
                 f"steps={steps}",
                 flush=True,
             )
     finally:
         env.close()
 
-    success = np.asarray([w["success"] for w in worlds], dtype=bool)
-    rewards = np.asarray([w["reward"] for w in worlds], dtype=np.float32)
-    max_bottles = np.asarray(
-        [w["final_task_eval"]["max_bottles_in_bin_so_far"] for w in worlds],
-        dtype=np.float32,
+    return build_summary(
+        config=config,
+        ckpt_path=ckpt_path,
+        device=device,
+        worlds=worlds,
+        out_dir=out_dir,
+        physics=physics,
     )
-    summary = {
-        "format": "abc_minimal_put_bottles_eval/v1",
-        "checkpoint": str(ckpt_path),
-        "prompt": config.prompt,
-        "config": asdict(config),
-        "resolved_device": device,
-        "success_rate": float(success.mean()) if success.size else None,
-        "num_success": int(success.sum()),
-        "num_worlds": len(worlds),
-        "mean_reward": float(rewards.mean()) if rewards.size else None,
-        "mean_max_bottles_in_bin": float(max_bottles.mean()) if max_bottles.size else None,
-        "worlds": worlds,
-    }
-    (out_dir / "summary.json").write_text(json.dumps(jsonable(summary), indent=2, sort_keys=True))
-    print(
-        f"summary: success_rate={summary['success_rate']} "
-        f"num_success={summary['num_success']}/{summary['num_worlds']} "
-        f"mean_reward={summary['mean_reward']} "
-        f"mean_max_bottles={summary['mean_max_bottles_in_bin']}",
-        flush=True,
-    )
-    print(f"wrote {out_dir / 'summary.json'}", flush=True)
-    return summary
 
 
 def main(config: SimEvalConfig) -> None:

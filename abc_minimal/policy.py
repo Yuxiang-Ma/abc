@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from abc_minimal.config import FlowConfig
 from abc_minimal.dit import CLIPTextEmbedder, DiTPolicy, load_pretrained
 from abc_minimal.preprocess import (
     normalize,
@@ -29,6 +30,34 @@ def resolve_norm_stats(ckpt: dict[str, Any], override: str | None) -> dict[str, 
     return parse_norm_stats(raw)
 
 
+def resolve_trained_max_prefix(ckpt: dict[str, Any]) -> int:
+    """The checkpoint's max_action_prefix training bound.
+
+    The bound is EXCLUSIVE: the trainer samples prefix lengths from
+    randint(0, max_action_prefix), so the longest prefix actually seen in
+    training is max_action_prefix - 1. Production checkpoints store a flat
+    train_config dict with max_action_prefix; this repo's trainer saves the
+    TrainConfig asdict, which nests it under flow. Fall back to the local
+    FlowConfig default when the checkpoint predates either convention.
+    """
+    train_config = ckpt.get("train_config")
+    raw = None
+    if isinstance(train_config, dict):
+        raw = train_config.get("max_action_prefix")
+        if raw is None and isinstance(train_config.get("flow"), dict):
+            raw = train_config["flow"].get("max_action_prefix")
+    elif train_config is not None:
+        # Tolerate non-dict train_configs (dataclass, Namespace, OmegaConf).
+        raw = getattr(train_config, "max_action_prefix", None)
+        if raw is None:
+            flow = getattr(train_config, "flow", None)
+            if flow is not None:
+                raw = getattr(flow, "max_action_prefix", None)
+    if raw is not None:
+        return int(raw)
+    return FlowConfig().max_action_prefix
+
+
 class DiTInferencePolicy:
     """Checkpoint-backed DiT inference shared by sim and deploy adapters."""
 
@@ -41,6 +70,7 @@ class DiTInferencePolicy:
         self.model.eval()
         self.norm_preset = preset_for_backbone(config.model.vision_backbone)
         self.norm_stats = resolve_norm_stats(ckpt, config.norm_stats_path)
+        self.trained_max_prefix = resolve_trained_max_prefix(ckpt)
         self.embedder = CLIPTextEmbedder(config.clip, device=self.device)
         self._prompt = config.prompt
         self.task_vec = self.embedder.encode([self._prompt]).to(self.device)

@@ -60,7 +60,7 @@ def restore_training_state(ckpt, *, optimizer, scheduler, resume_step, rank, sou
 
 
 def save_checkpoint(path, *, module, optimizer, scheduler, global_step, norm_stats,
-                    batch_size=None, data_world=None) -> None:
+                    batch_size=None, data_world=None, train_config=None) -> None:
     """Write the checkpoint via tmp file + rename so a crash mid-write can
     never leave a truncated file where resume looks."""
     payload = {
@@ -74,6 +74,10 @@ def save_checkpoint(path, *, module, optimizer, scheduler, global_step, norm_sta
         payload["batch_size"] = int(batch_size)
     if data_world is not None:
         payload["data_world"] = int(data_world)
+    if train_config is not None:
+        # Plain dict so eval-side readers (resolve_trained_max_prefix) need
+        # no import of this repo's dataclasses to interpret it.
+        payload["train_config"] = train_config
     tmp = path.with_name(path.name + ".tmp")
     torch.save(payload, tmp)
     tmp.replace(path)

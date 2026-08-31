@@ -129,7 +129,6 @@ class FastInferenceGraph:
         actions_np = self.output[0].float().detach().cpu().numpy()
         return unnormalize(actions_np, self.policy.norm_stats["actions"]).astype(np.float32)
 
-
 class FastRTCInferenceGraph(FastInferenceGraph):
     def __init__(self, policy: _PolicyForFastInference, prefix_length: int):
         super().__init__(policy)

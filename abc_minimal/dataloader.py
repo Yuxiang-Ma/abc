@@ -98,8 +98,51 @@ def scan_episodes(data_dir, default_task_name, model_config: DiTConfig):
             meta = json.loads((ep_dir / "episode_metadata.json").read_text())
         cams = meta.get("cameras") or model_config.camera_keys
         task_name = meta.get("task_name") or default_task_name
-        episodes.append((ep_dir, length, usable, tuple(cams), task_name))
+        episodes.append(
+            (ep_dir, length, usable, tuple(cams), task_name,
+             _episode_prompt(ep_dir, meta, task_name))
+        )
     return episodes
+
+
+def _episode_prompt(ep_dir, meta, task_name):
+    """The episode's directive from episode_metadata's instruction field, or
+    None for the task_name derivation.
+    """
+    instruction = meta.get("instruction")
+    if isinstance(instruction, str) and instruction.strip():
+        if task_name_to_prompt(instruction) != task_name_to_prompt(task_name or ""):
+            return instruction.strip()
+
+    recorded = _randomization_prompt(ep_dir)
+    if recorded is not None and task_name_to_prompt(recorded) != task_name_to_prompt(
+        task_name or ""
+    ):
+        raise ValueError(
+            f"{ep_dir.name}: randomization.json records the directive "
+            f"{recorded!r} but episode_metadata.json's instruction does not "
+            "carry it, so this cache predates the instruction prompt schema. "
+            "Re-download the task's episodes (the published sim_224 tars now "
+            "mirror the directive into instruction), or copy randomization's "
+            "metadata prompt into each episode_metadata.json instruction field."
+        )
+    return None
+
+
+def _randomization_prompt(ep_dir):
+    """The prompt randomization.json recorded, used only to validate that a
+    cache's episode_metadata carries the directive (see _episode_prompt)."""
+    rand_path = ep_dir / "randomization.json"
+    if not rand_path.exists():
+        return None
+    try:
+        metadata = json.loads(rand_path.read_text()).get("metadata") or {}
+    except (json.JSONDecodeError, OSError):
+        return None
+    prompt = metadata.get("prompt")
+    if isinstance(prompt, str) and prompt.strip():
+        return prompt.strip()
+    return None
 
 def read_state_action_rows(ep_dir, start, end, model_config: DiTConfig):
     row_width = model_config.state_dim + model_config.action_dim
@@ -109,9 +152,60 @@ def read_state_action_rows(ep_dir, start, end, model_config: DiTConfig):
         raw = f.read((end - start) * row_bytes)
     return np.frombuffer(raw, dtype=np.float64).reshape(-1, row_width)
 
+_KEYFRAME_CACHE: dict = {}
+
+
+def _mp4_sync_samples(path):
+    """1-based keyframe sample numbers from the mp4's stss box, or None.
+
+    The container records exactly which samples are sync samples; reading it
+    is a few kilobytes, where re-probing the whole stream per sample is not.
+    An absent stss box means every sample is a keyframe (per ISO 14496-12),
+    which the caller treats as "no mapping needed".
+    """
+    import struct
+
+    def walk(f, start, end, chain):
+        f.seek(start)
+        while f.tell() < end:
+            head = f.tell()
+            header = f.read(8)
+            if len(header) < 8:
+                return None
+            size, kind = struct.unpack(">I4s", header)
+            header_len = 8
+            if size == 1:
+                size = struct.unpack(">Q", f.read(8))[0]
+                header_len = 16
+            if size == 0:
+                size = end - head
+            if size < header_len:  # malformed; let the caller fall back
+                return None
+            body = head + header_len
+            if kind == chain[0]:
+                if len(chain) == 1:
+                    f.seek(body + 4)  # version/flags
+                    (count,) = struct.unpack(">I", f.read(4))
+                    return list(struct.unpack(f">{count}I", f.read(4 * count)))
+                found = walk(f, body, head + size, chain[1:])
+                if found is not None:
+                    return found
+            f.seek(head + size)
+        return None
+
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            file_end = f.tell()
+            return walk(f, 0, file_end, [b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stss"])
+    except (OSError, struct.error):
+        return None
+
+
 def decode_frame(ep_dir, idx, episode_length, source_cameras, camera_keys):
     """Decode combined-video frame idx via torchcodec with a synthesized CFR
-    frame map (pts = 512*k, 1/15360 timebase), without per-file probing.
+    frame map (pts = 512*k, 1/15360 timebase) whose keyframe flags come from
+    the file's own sync-sample table.
 
     `source_cameras` is the actual stack order in combined mp4. Stereo episodes
     deterministically alias one top eye to `top`, matching production export.
@@ -119,14 +213,24 @@ def decode_frame(ep_dir, idx, episode_length, source_cameras, camera_keys):
     import hashlib
     from torchcodec.decoders import VideoDecoder
 
-    frames = [
-        {"pts": 512 * i, "duration": 512, "key_frame": 1 if i % 30 == 0 else 0}
-        for i in range(episode_length)
-    ]
-    mapping = json.dumps({"frames": frames})
-    decoder = VideoDecoder(
-        str(ep_dir / "combined_camera-images-rgb.mp4"), custom_frame_mappings=mapping
-    )
+    video_path = ep_dir / "combined_camera-images-rgb.mp4"
+    keyframes = _KEYFRAME_CACHE.get(ep_dir)
+    if keyframes is None:
+        sync = _mp4_sync_samples(video_path)
+        keyframes = frozenset(n - 1 for n in sync) if sync else frozenset()
+        _KEYFRAME_CACHE[ep_dir] = keyframes
+
+    if keyframes:
+        frames = [
+            {"pts": 512 * i, "duration": 512, "key_frame": 1 if i in keyframes else 0}
+            for i in range(episode_length)
+        ]
+        decoder = VideoDecoder(
+            str(video_path), custom_frame_mappings=json.dumps({"frames": frames})
+        )
+    else:
+        # No sync-sample table to trust: let the decoder probe the stream.
+        decoder = VideoDecoder(str(video_path))
     frame = decoder[idx]  # (C, n_cams * H, W) uint8
     n_cams = len(source_cameras)
     h = frame.shape[1] // n_cams
@@ -172,7 +276,7 @@ class EpisodeDataset(Dataset):
         # Per-episode sidecar caches, filled lazily as episodes are first sampled.
         self._subtask_cache = {}
         self._operator_cache = {}
-        self.cum = np.cumsum([usable for _, _, usable, _, _ in self.episodes])
+        self.cum = np.cumsum([usable for _, _, usable, _, _, _ in self.episodes])
 
     def __len__(self):
         return int(self.cum[-1])
@@ -184,7 +288,7 @@ class EpisodeDataset(Dataset):
     def __getitem__(self, global_idx):
         ep_idx = int(np.searchsorted(self.cum, global_idx, side="right"))
         k = int(global_idx - (self.cum[ep_idx - 1] if ep_idx > 0 else 0))
-        ep_dir, length, _, source_cameras, task_name = self.episodes[ep_idx]
+        ep_dir, length, _, source_cameras, task_name, recorded_prompt = self.episodes[ep_idx]
 
         rows = read_state_action_rows(
             ep_dir, k, k + self.model_config.chunk_length, self.model_config
@@ -203,7 +307,7 @@ class EpisodeDataset(Dataset):
             self.train,
             norm_preset=self.norm_preset,
         )
-        prompt = self.build_prompt(ep_dir, k, task_name)
+        prompt = self.build_prompt(ep_dir, k, task_name, recorded_prompt)
         return {
             "state": torch.from_numpy(state),
             "actions": torch.from_numpy(actions),
@@ -212,11 +316,12 @@ class EpisodeDataset(Dataset):
             "prompt": prompt,
         }
 
-    def build_prompt(self, ep_dir, frame_idx, task_name):
-        """Compose the text prompt from the task name plus optional subtask
-        and operator labels.
+    def build_prompt(self, ep_dir, frame_idx, task_name, recorded_prompt=None):
+        """Compose the text prompt from the episode's recorded directive (when
+        it has one -- see _episode_prompt) or the task name, plus optional
+        subtask and operator labels.
         """
-        base = task_name_to_prompt(task_name)
+        base = recorded_prompt or task_name_to_prompt(task_name)
         prompt = self._apply_subtask(base, ep_dir, frame_idx)
         prompt = self._apply_operator(prompt, ep_dir, task_name)
         return prompt
@@ -371,12 +476,21 @@ def build_val_loaders(config, components, norm_stats, data_scope, operator_label
     ]
     val_loaders = {}
     for name, val_ds in val_components:
-        val_indices = list(
-            range(
-                data_scope.rank,
-                min(len(val_ds), config.val_batches * config.batch_size * data_scope.world),
-                data_scope.world,
-            )
+        # The eval budget has to be spread across the WHOLE split: taking the
+        # first budget-many indices evaluates a couple of episodes' consecutive
+        # frames (720 frames ≈ 2 episodes at defaults) and silently miscovers
+        # val while reporting itself as the split's number.
+        budget = config.val_batches * config.batch_size * data_scope.world
+        if len(val_ds) <= budget:
+            all_indices = range(len(val_ds))
+        else:
+            step = len(val_ds) / budget
+            all_indices = (int(i * step) for i in range(budget))
+        val_indices = list(all_indices)[data_scope.rank :: data_scope.world]
+        print(
+            f"[val] {name}: {len(val_indices)} of {len(val_ds)} frames per rank, "
+            f"evenly strided across the split",
+            flush=True,
         )
         val_loaders[name] = DataLoader(
             torch.utils.data.Subset(val_ds, val_indices),

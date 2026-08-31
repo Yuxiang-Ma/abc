@@ -7,6 +7,7 @@ import gzip
 import html
 import math
 import os
+import tempfile
 import urllib.request
 from functools import lru_cache
 from pathlib import Path
@@ -43,9 +44,27 @@ def _load_clip_text_deps():
 
 
 def _download_if_missing(url, path):
+    """Fetch url to path once, and only publish it once it is whole.
+
+    The cache these assets land in is shared between checkouts and processes, so
+    a transfer in progress must never be visible under the final name: a second
+    eval starting on a cold cache would read the partial file and report it as a
+    corrupt checkpoint. Downloading beside the destination and renaming makes the
+    file appear atomically; a duplicate download is the only cost of a race.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists():
-        urllib.request.urlretrieve(url, path)
+    if path.exists():
+        return
+    handle, partial_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f"{path.name}.", suffix=".part"
+    )
+    os.close(handle)
+    partial = Path(partial_name)
+    try:
+        urllib.request.urlretrieve(url, partial)
+        partial.replace(path)
+    finally:
+        partial.unlink(missing_ok=True)
 
 
 def ensure_clip_text_assets(config: ClipConfig):
@@ -218,7 +237,15 @@ class CLIPTextEmbedder:
         try:
             state_dict = torch.jit.load(str(b32_path), map_location="cpu").state_dict()
         except RuntimeError:
-            state_dict = torch.load(b32_path, map_location="cpu", weights_only=False)
+            try:
+                state_dict = torch.load(b32_path, map_location="cpu", weights_only=False)
+            except RuntimeError as exc:
+                # Read as a corrupt policy checkpoint otherwise: this is CLIP's
+                # download cache, and deleting it re-fetches the encoder.
+                raise RuntimeError(
+                    f"CLIP text encoder cache {b32_path} is unreadable ({exc}). "
+                    "Delete it and re-run to download it again."
+                ) from exc
         self.tokenizer = CLIPBPETokenizer(bpe_path)
         self.model = CLIPTextTower(state_dict).eval().to(self.device)
         text_keys = {
@@ -426,7 +453,6 @@ class DinoRope(nn.Module):
         coords = coords.flatten(0, 1)
         coords = 2.0 * coords - 1.0
 
-        # applies a random log-uniform rescale of the coordinates
         if self.training and self.rescale_coords is not None:
             r = np.log(self.rescale_coords)
             rescale = torch.empty(1, device=dev).uniform_(-r, r).exp()
@@ -556,7 +582,6 @@ class DinoVisionTransformer(nn.Module):
             elif isinstance(m, LayerScale):
                 nn.init.constant_(m.gamma, 1e-5)
             elif isinstance(m, DinoPatchEmbed):
-                # Match nn.Conv2d default
                 m.proj.reset_parameters()
 
     def encode_image_tokens(self, images):
@@ -784,7 +809,7 @@ class DiTPolicy(nn.Module):
 
         self.x_embedder = nn.Linear(config.state_dim, H)
         self.y_embedder = nn.Linear(config.action_dim, H)
-        # Vestigial from previous checkpoints, we no longer do this projection step in forward but keep for conpat.
+        # Retained only for checkpoint compatibility.
         img_global_dim = (
             CLIP_VISION_OUTPUT_DIM if config.vision_backbone == "clip" else config.vit_embed_dim
         )
@@ -845,11 +870,22 @@ class DiTPolicy(nn.Module):
         Returns (B, num_cameras * queries, hidden)."""
         batch_size = images[self.camera_keys[0]].shape[0]
         camera_count = len(self.camera_keys)
-        all_images = torch.cat([images[cam] for cam in self.camera_keys], dim=0)
-        all_tokens = self.img_backbone.encode_image_tokens(all_images)
-        all_tokens = all_tokens.reshape(
-            camera_count, batch_size, all_tokens.shape[1], all_tokens.shape[2]
-        )
+        if batch_size * camera_count <= 32:
+            # Fuse small inference batches for GPU utilization.
+            all_images = torch.cat([images[cam] for cam in self.camera_keys], dim=0)
+            all_tokens = self.img_backbone.encode_image_tokens(all_images)
+            all_tokens = all_tokens.reshape(
+                camera_count, batch_size, all_tokens.shape[1], all_tokens.shape[2]
+            )
+        else:
+            # Split large training batches to limit backbone activation memory.
+            all_tokens = torch.stack(
+                [
+                    self.img_backbone.encode_image_tokens(images[cam])
+                    for cam in self.camera_keys
+                ],
+                dim=0,
+            )
 
         pooled = []
         for index, cam in enumerate(self.camera_keys):

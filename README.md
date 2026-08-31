@@ -13,15 +13,22 @@
 
 Code for the ABC project.
 
-> Note: we have released a minimal ABC-DiT training and real-robot deployment
-> pipeline, plus data conversion scripts. VLA training and deployment are not
-> part of this release yet.
-
-
 ## Release Roadmap
 - [x] June 17 -- Release Minimal Training Pipeline
-- [ ] End of June -- Release all sim data 
-- [ ] By end of July -- full code release
+- [ ] Sep 1 -- Release all sim data  (sorry for the delay!)
+- [ ] Sep 1 -- full code release
+
+## Repo layout
+
+This README is a quickstart for local training — the package READMEs above hold the full reference for their areas.
+
+| Package | What it holds |
+| --- | --- |
+| [`abc_minimal/`](abc_minimal/README.md) | ABC models, dataloader, training loop, policy inference, episode tools |
+| [`abc_sim/`](abc_sim/README.md) | self-contained simulator: MuJoCo scenes, task catalogue, randomization, evaluators, Gym API, sim eval |
+| [`deploy/`](deploy/README.md) | real-robot deployment: local/remote inference, RTC, teleop, DAgger, recording |
+
+`train.py`, `eval_policy.py`, `viz_episode.py`, `viz_policy.py`, and `prepare.py` at the root are the entrypoints; `scripts/` holds the data conversion utilities. 
 
 ## Setup
 
@@ -42,13 +49,14 @@ uv python pin 3.12
 uv sync
 ```
 
-## Training
+## Training an ABC-DiT
 
 First we need to download the requisite data (norm stats and either a sample or full data.)
 ```bash
 uv run prepare.py            # preview (a few episodes of data, ~130MB)
 uv run prepare.py --full     # all data for bottles in bin (~35GB)
-uv run prepare.py --checkpoint  # add to also pull the pretrained 75k policy (~7.7GB)
+uv run prepare.py --checkpoint  # add to also pull the pretrained 75k policy (~8.1GB)
+uv run prepare.py --sim-data sim_spell_abc  # one sim task's episodes + its assets (--sim-data-list to browse)
 ```
 
 This populates the cache dir (default `cache/`, or `ABC_CACHE` if set) with:
@@ -75,97 +83,104 @@ uv run torchrun --standalone --nproc-per-node 8 train.py
 # Resume from a local checkpoint, including optimizer/scheduler and data stream position.
 uv run torchrun --standalone --nproc-per-node 8 train.py --resume-from cache/finetune_checkpoints/last.pt
 ```
-The dataclass config is exposed as CLI flags; `uv run python train.py --help`
-shows training, optimizer, flow, CLIP asset, and model options such as
-`--model.hidden-size`, `--model.depth`, and `--model.camera-keys`. The default
-model config is the checkpoint-compatible ABC-DiT XL shape.
+The dataclass config is exposed as CLI flags; `uv run python train.py --help` shows training, optimizer, flow, CLIP asset, and model options. The default model config is the checkpoint-compatible ABC-DiT XL shape.
 
-If you pulled with `--full` above, this checkpoint is expected to work for
-the bottles in bin task in both sim and real. The performance should be similar
-to [this](assets/bottles_real.mp4).
+If you pulled with `--full` above, this checkpoint is expected to work for the bottles in bin task in both sim and real. The performance should be similar to [this](assets/bottles_real.mp4).
 
-Training defaults in `abc_minimal/config.py` match the production reference
-finetune (lr 1e-4 with a 1k-step linear warmup, AdamW(0.9, 0.95), wd 0.01,
-grad clip 10, prefix conditioning max 4 with noise 0.05, 10% state masking,
-batch 90/GPU, 75k steps, hours-weighted 2-component mixture).
-The dataclass config is exposed as CLI flags; `uv run python train.py --help`
-shows training, optimizer, flow, CLIP asset, and model options such as
-`--model.hidden-size`, `--model.depth`, and `--model.camera-keys`. The default
-model config is the checkpoint-compatible ABC-DiT XL shape. If you have fewer GPUs
-than 8 you may need to reduce nproc per node or if you have less than 80Gb of
-VRAM you may need to reduce `--batch-size`.
+Training defaults in `abc_minimal/config.py` match the production reference finetune (lr 1e-4 with a 1k-step linear warmup, AdamW(0.9, 0.95), wd 0.01, grad clip 10, prefix conditioning max 8 with noise 0.05, 10% state masking, batch 90/GPU, 75k steps, hours-weighted 2-component mixture).
 
-The above training yields ~2.6-3 iterations / sec on H100/H200. It achieves a training
-loss of ~`0.048` after 75k steps.
+If you have fewer GPUs than 8 you need to reduce nproc per node or if you have less than 80Gb of VRAM you may need to reduce `--batch-size`.  The above training yields ~2.6-3 iterations / sec on H100/H200. It achieves a training loss of ~`0.048` after 75k steps.  The DiT policy also supports a CLIP ViT-B/16 vision backbone (in place of DINOv3) via `--model.vision-backbone clip`.
 
-The DiT policy also supports a CLIP ViT-B/16 vision backbone (in place of DINOv3)
-via `--model.vision-backbone clip`, which selects the CLIP visual tower and CLIP
-image normalization. This is the configuration you finetune from when adapting a
-CLIP-DiT checkpoint to a new task such as t-shirt folding.
+To finetune from a released checkpoint instead of training from scratch, download the parent and pass `--load-pretrained` (fresh optimizer, step 0):
 
-To finetune from a released checkpoint instead of training from scratch, pass
-`--load-pretrained` (fresh optimizer, step 0); `--pretrained-ckpt-name` picks
-the checkpoint file inside the cache dir (default `abc_dit_xl_200k_model.pt`).
-Normalization stats embedded in the checkpoint are inherited by default, so no
-standalone `norm_stats.json` is needed (`--no-inherit-ckpt-norm-stats` forces
-`cache/norm_stats.json` instead). Combine with `--model.vision-backbone clip`
-when the parent is a CLIP-DiT checkpoint.
+```bash
+# Pulls cache/abc_dit_xl_200k_model.pt (~8.1 GB)
+uv run prepare.py --pretrained
+uv run train.py --load-pretrained
+```
+
+`--pretrained-ckpt-name` picks the checkpoint file inside the cache dir (default`abc_dit_xl_200k_model.pt`, which is what `--pretrained` downloads). (Use with `--model.vision-backbone clip`when the parent is a CLIP-DiT checkpoint, as DiNO is the default). 
+
+**Multi-node training, the episode data format, and prompt conditioning options
+are documented in the [abc_minimal README](abc_minimal/README.md).**
+
+## Viewing the Sim Data
+
+To download and view particular tasks from the sim data, and visualise the episodes, use the following
+
+```bash
+uv run prepare.py --sim-data-list # list possible tasks
+uv run prepare.py --sim-data conveyor_pick # download one from the list
+uv run viz_episode.py --root cache/train_sim --port 8080 # visualise data
+```
+
+The replay modes (pose playback vs physics re-simulation) are described in the
+[abc_minimal README](abc_minimal/README.md#visualizing-episodes-and-policies).
 
 ## Evaluation
 
-You can either evaluate a checkpoint you trained yourself (drops into
-`cache/finetune_checkpoints/last.pt`) or download our public
-pretrained 75k-step bottles policy:
+`eval_policy.py` evaluates a checkpoint on the `abc_sim/` task catalogue — one
+you trained yourself (drops into `cache/finetune_checkpoints/last.pt`) or any
+of the released ones:
 
 ```bash
-# Pulls cache/bottles_75k.pt (~7.7 GB) from the public bucket,
+# bottles_75k.pt (~8.1 GB): the 75k-step bottles-only policy, pulled
 # alongside norm_stats.json and the preview tar.
 uv run prepare.py --checkpoint
+
+# abc_dit_xl_200k_model.pt (~8.1 GB) + its prompt sidecar: the multi-task
+# sim policy, which is also the --load-pretrained finetuning parent.
+uv run prepare.py --pretrained
+
+# Per-task finetunes of that parent (~8 GB each: model-only; add
+# --sim-checkpoint-full-state for the ~24 GB training-state file), one per sim
+# task, resolved through the checkpoint manifest — downloads the task's
+# recommended step (not always 25k), sha256-verifies, and prints the
+# matching eval command. --sim-checkpoint-list shows the catalogue + results.
+uv run prepare.py --sim-checkpoint pour
 ```
 
-To visualize the policy live:
+The pretrained download installs assets for every supported sim task, then
+prints the task names followed by compact eval and viewer command templates.
+Evaluation and viewing both read the checkpoint sidecar and automatically use
+the exact prompt that task trained under.
+
+To watch a released finetuned policy live in a viser window at
+`localhost:8080`, prepare the task bundle once, then select the task in the
+viewer. A bundle contains the task's sim assets and recommended checkpoint
+(~8 GB model-only, sha-verified), but not its episode data:
 
 ```bash
-uv run viz_policy.py --sim.checkpoint cache/bottles_75k.pt --port 8080
+uv run prepare.py --sim-bundle-list
+uv run prepare.py --sim-bundle put_plastic_bottles_in_bin
+uv run viz_policy.py --sim.task put_plastic_bottles_in_bin --port 8080
 ```
 
-opens a viser window at `localhost:8080`. It should look like this:
+The viewer resolves the locally cached recommended checkpoint and its published
+training prompt from the checkpoint manifest. Pass `--sim.checkpoint` or
+`--sim.prompt` only to override those defaults.
 
 ![](assets/sim_eval.gif)
 
-`eval_policy.py` runs a more systematic evaluation:
+To run the evaluation, download the sim assets once (`uv run prepare.py --sim`;
+the first launch also compiles MJWarp's CUDA kernels, ~1 min):
 
 ```bash
 # 20 worlds, save a video of each rollout, log per-chunk progress.
 uv run eval_policy.py \
     --checkpoint cache/bottles_75k.pt \
     --num-worlds 20 \
-    --save-video --log-every-chunk
+    --save-video --video-every-n-actions 15 --log-every-chunk
 
-# Output: $REPO/outputs/sim_eval_put_bottles/
-#   summary.json     — success_rate, num_success, mean_max_bottles_in_bin
+# Output: $REPO/outputs/sim_eval_put_plastic_bottles_in_bin/
+#   summary.json     — success_rate, num_success, mean_reward,
+#                      mean_max_progress, mean_max_bottles_in_bin
 #   world_*.mp4      — per-world rollout videos (with --save-video)
 ```
 
-Useful flags:
-
-- `--num-worlds N` — independent random scenes (default 5).
-- `--num-chunks N` — action chunks per rollout; each chunk is
-`--execute-chunk-dim` actions (defaults: 120 chunks × 15 = 1800 sim steps).
-- `--diffusion-steps N` — flow-matching Euler steps per inference
-(default 10, matches production).
-- `--checkpoint` — path to the `.pt` checkpoint to evaluate.
-- `--norm-stats-path` — explicit `norm_stats.json` (otherwise uses the
-one bundled in the checkpoint).
-- `--fast-inference` / `--no-fast-inference` (default on) — bf16 +
-torch.compile + CUDA-graph captured `sample_actions`. ~5× faster
-inference; first call pays a one-time ~25 s compile cost.
-- `--vanilla-physics` / `--no-vanilla-physics` (default off) — enable
-vanilla CPU `mujoco.mj_step` for env physics instead of the default
-single-world mjwarp path.  This is because for single environments, it's
-faster to use vanilla mujoco. Rendering still happens in MJWarp.
-
-Note that the first launch compiles MJWarp's CUDA kernels (~1 min).
+Any catalogue task is selected by name with `--task`. The task list, eval
+flags, prompt defaults, and the released checkpoints' expected numbers are all
+documented in the [abc_sim README](abc_sim/README.md#sim-eval).
 
 ## Real-robot deployment
 
@@ -175,134 +190,26 @@ hardware dependencies with `uv sync --extra deploy`.
 
 ## Episode exports & training data format
 
-While we host a single task in training format, there are many more in the ABC Dataset.
-The ABC-130k MCAPs are hosted on Hugging Face at
-[`XDOF/ABC-130k`](https://huggingface.co/datasets/XDOF/ABC-130k). The dataset
-is gated, so accept access on the dataset page and set `HF_TOKEN` before
-downloading.
-
-Download all MCAPs for one task and convert them in place:
+While we host a single task in training format, there are many more in the ABC
+Dataset. The ABC-130k MCAPs are hosted on Hugging Face at
+[`XDOF/ABC-130k`](https://huggingface.co/datasets/XDOF/ABC-130k) (the dataset
+is gated, so accept access on the dataset page and set `HF_TOKEN`). Download
+all MCAPs for one task and convert them in place:
 
 ```bash
 uv run scripts/export_hf_task.py --task organize_the_condiment_bottles
 ```
 
-By default this downloads both `train` and `val`, stages raw MCAPs under
-`$ABC_CACHE/hf_tasks/<task>/`, runs the MCAP converter, writes converted episodes
-to `$ABC_CACHE/train_real/` and `$ABC_CACHE/val_real/`, then deletes the staged
-raw MCAPs after each successful split conversion. For a quick smoke test:
-
-```bash
-uv run scripts/export_hf_task.py --task organize_the_condiment_bottles --split train --max-episodes 1
-```
-
-For multi-node jobs without a shared filesystem, predownload a deterministic
-node-local shard on each node before launching training:
-
-```bash
-ABC_CACHE=/local_nvme/abc_cache HF_TOKEN=... \
-uv run scripts/prepare_hf_shards.py \
-  --tasks organize_the_condiment_bottles \
-  --num-nodes 8 --node-rank $NODE_RANK --workers 8
-
-ABC_CACHE=/local_nvme/abc_cache \
-uv run torchrun --nnodes 8 --node-rank $NODE_RANK --nproc-per-node 8 train.py
-```
-
-The predownload step writes this node's converted episodes into the usual
-`train_real/` and `val_real/` directories. Training auto-detects the
-`hf_status/shard.json` marker and uses local-rank sampling, so validation
-metrics are accumulated across different validation shards on different GPUs.
-
-The revision is pinned to a commit SHA at run time and training verifies at
-startup that all nodes sharded the same snapshot. If the dataset may change
-while nodes prepare, pass the same explicit `--revision <sha>` to every node.
-
-If you already have local MCAPs, call the lower-level converter directly:
-
-```bash
-uv run scripts/export_mcap.py ./train_run_1 ./out
-```
-
-The input is expected to look like:
-
-```text
-train_run_1/
-  <task_name>/
-    episode_<uuid>/
-      episode.mcap
-```
-
-You can also pass the number of worker processes:
-
-```bash
-uv run scripts/export_mcap.py ./train_run_1 ./out 8
-```
-
-Each output episode is written to `./out/episode_<uuid>/` in the same format
-the trainer reads:
-
-```text
-episode_<uuid>/
-  states_actions.bin               # (num_steps, 28) float64: 14 states + 14 actions
-  combined_camera-images-rgb.mp4   # 30 fps vertical stack of 224x224 camera views
-  episode_metadata.json            # task name, cameras, resolutions, timing, num_steps
-```
-
-The mp4 is encoded in a manner that allows for efficient dataloading. For details, see the ABC paper.
-
-### Subtask & operator conditioning
-
-In addition to the task prompt, our policies can condition  **subtask** labels and on
-the episode's **operator** id. The MCAP converter (`scripts/export_mcap.py`)
-extracts both from the release MCAPs when present and writes two optional
-extra files next to the episode:
-
-```text
-episode_<uuid>/
-  subtasks.json      # {"<frame_idx>": "<subtask label>", ...}  — per-frame subtask
-  operator.json      # {"operator_id": "<uuid>"}                — the teleoperator id
-```
-
-- **Subtasks** Enable at train time with `--prompt.use-subtask-as-prompt`,
-  choosing `--prompt.subtask-mode {replace,append}` (`replace` swaps the task prompt for the subtask label;
-  `append` formats both via `--prompt.subtask-append-format`).
-- **Operators** We map UUIDs to short deterministic labels (`operator 0`, … or names). The labels are computed
-per-task such that operators with more hours (proxy for quality) have lower numbers.
-Enable with `--prompt.use-operator-id-as-prompt` and choose `--prompt.operator-prompting-mode {text_indexed,text_name}`; the label is appended as `"{prompt}. {operator}"`.
-
-  The per-task map must be built prior to training and passed via
-  `--prompt.operator-label-map-path`. Build it with:
-
-  ```bash
-  ABC_CACHE=cache/tshirt uv run scripts/build_operator_label_map.py \
-      --out cache/tshirt/operator_label_map.json
-  ```
-
-  then pass `--prompt.operator-label-map-path cache/tshirt/operator_label_map.json`.
-
-  On a node-sharded multi-node cache no single machine holds every episode, and
-  a map built from one shard would mis-rank operators and miss those on other
-  nodes. Instead, build one manifest per node from its local shard, gather the
-  shard manifests on one machine, and fold them into a global ranking —
-  hours and episode counts sum exactly across shards, so the result matches a
-  full single-machine scan:
-
-  ```bash
-  uv run scripts/build_operator_label_map.py --out shard_$NODE.json   # on each node
-  uv run scripts/build_operator_label_map.py \
-      --combine shard_0.json shard_1.json ... --out operator_label_map.json
-  ```
-
-  then copy the combined manifest to every node at the same path and pass it
-  via `--prompt.operator-label-map-path`.
-
-Both are off by default. Some episodes do not have eg. subtask annotations and 
-for these training will drop back to task prompt only.
-
-(We intend to release the global manifest in future but this is TODO.)
+The episode format the trainer reads, the local MCAP converter, multi-node
+sharded downloads, and subtask/operator conditioning are documented in the
+[abc_minimal README](abc_minimal/README.md#training-data).
 
 ## Licenses
+
+The code in this repository is Apache-2.0 ([`LICENSE`](LICENSE)), and so are the
+model weights we publish — both `bottles_75k.pt` and `abc_dit_xl_200k_model.pt`.
+Both checkpoints embed a DINOv3-derived vision backbone, so the DINOv3 use
+restrictions below apply to the weights as well as to the code that loads them.
 
 This repository includes and adapts code from the following third-party
 projects. Original license files and copyright headers are retained in all
@@ -314,7 +221,28 @@ cases. Bundled license texts live under `assets/third_party/`.
 | [OpenAI CLIP](https://github.com/openai/CLIP) | MIT | [`assets/third_party/clip/LICENSE`](assets/third_party/clip/LICENSE) | Adapted (`abc_minimal/dit.py`); ViT-B/32 text weights + BPE vocab downloaded at runtime | CLIP text encoder + BPE tokenizer (`CLIPBPETokenizer`, `CLIPTextTower`, `CLIPTextEmbedder`) |
 | [openpi](https://github.com/Physical-Intelligence/openpi) | Apache 2.0 | [`assets/third_party/openpi/LICENSE`](assets/third_party/openpi/LICENSE) | Adapted (`deploy/client/websocket_client_policy.py`, `deploy/client/msgpack_numpy.py`) | Websocket inference client skeleton + msgpack NumPy serialization |
 | [msgpack-numpy](https://github.com/lebedov/msgpack-numpy) | BSD 3-Clause | [`assets/third_party/msgpack_numpy/LICENSE.md`](assets/third_party/msgpack_numpy/LICENSE.md) | Adapted (`deploy/client/msgpack_numpy.py`, via openpi) | NumPy serialization strategy for msgpack |
-| [i2rt YAM](https://github.com/i2rt-robotics) | MIT | [`assets/put_bottles/assets/i2rt_yam/LICENSE`](assets/put_bottles/assets/i2rt_yam/LICENSE) | Vendored under `assets/put_bottles/assets/i2rt_yam/` | YAM robot MuJoCo model, meshes, and scene assets |
+
+### Simulator asset licenses
+
+The simulator asset packages installed by `prepare.py --sim` (and the RoboCasa
+packs fetched by `--sim-robocasa`) bundle meshes and textures from the sources
+below. abc-side processing — recentering, rescaling, trimesh re-export, resized
+textures, custom convex collision decompositions, and retuned MJCF wrappers —
+does not change the upstream licenses. Per-object credits ship inside the
+packages where noted.
+
+| Source | License | Where it is used |
+| --- | --- | --- |
+| [RoboCasa](https://github.com/robocasa/robocasa) objaverse pack: objects curated from [Objaverse 1.0](https://objaverse.allenai.org/objaverse-1.0), originally by individual Sketchfab creators | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) (RoboCasa asset release) | `mug`; the object libraries in `task_put_relative`, `task_grab_clutter`, and `task_conveyor_pick`; mug variants in `task_mug_flip` and `task_mug_tree`; plates in `task_dishrack`; bottles in `task_water_bottles`; objects in `task_multi_drawer_search` and `task_inhand_transfer`; the verbatim pack via `--sim-robocasa` |
+| RoboCasa lightwheel pack: objects by [LightWheel AI](https://www.lightwheel.ai/) | CC BY 4.0 (RoboCasa asset release) | object variants in `task_put_relative`, `task_grab_clutter`, `task_conveyor_pick`, `task_inhand_transfer`, and `task_multi_drawer_search`; dish racks in `task_dishrack`; the verbatim pack via `--sim-robocasa` |
+| RoboCasa aigen pack: AI-generated objects ([Luma.ai](https://lumalabs.ai/)) | CC BY 4.0 (RoboCasa asset release) | `bowl` |
+| [Google Scanned Objects](https://github.com/kevinzakka/mujoco_scanned_objects) | CC BY 4.0 | Two office objects in `task_multi_drawer_search`; per-object credits in the package's `OFFICE_ATTRIBUTIONS.md` |
+| Sketchfab creators, individually credited | CC BY 4.0 | Six office objects in `task_multi_drawer_search` (see `OFFICE_ATTRIBUTIONS.md`); the box and crate in `task_bins` (see the package `README.md`); the Fujiya tin in `task_chess` by [Vision Fountain](https://sketchfab.com/visionfountain); [`bin`](https://sketchfab.com/3d-models/bin-8984db4f15284436ab704919327ca251) by [AlaPasta](https://sketchfab.com/alapasta); [`blocks`](https://sketchfab.com/3d-models/wooden-alphabet-blocks-5f8dfddbbc7d468784ca014378f7e5fe) by [Cherryvania](https://sketchfab.com/mikequeen123); [`dustpan`](https://sketchfab.com/3d-models/dustpan-d91eae20c02a4741aeb889246b417ae4) by [c_irby_paint](https://sketchfab.com/cirby2180); [`garbage_can`](https://sketchfab.com/3d-models/garbage-can-trashcan-bin-926826667ff04fb09a0907bbec54c766) by [BlackCube](https://sketchfab.com/blackcube4), including its copy in `task_water_bottles`; [`paper_ball`](https://sketchfab.com/3d-models/paper-ball-8afd2bfbe8c14fad937f768617d55f9e) by [ianshanewise](https://sketchfab.com/ianshanewise); [`tray`](https://sketchfab.com/3d-models/plastic-tray-e9b536258ae4499abec7b31ebd231daf) by [Aullwen](https://sketchfab.com/Aullwen) |
+| [freepoly.org](https://freepoly.org/) | CC0 | The yellow tin in `task_chess` |
+| [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) | MIT | The `short_cabinet` drawer fixture in `task_multi_drawer_search`; license copy in the package |
+| [i2rt YAM](https://github.com/i2rt-robotics) | MIT | The `i2rt_yam` robot model package; license copy in the package |
+| This project | Apache-2.0 | Everything else, modeled or scanned in-house: `ball_sorting_toy`, `brush`, `brush_flat`, `building_blocks`, `chess`, `cup_stacking`, `dishrack`, `drawer`, `flexible_gripper`, `hand_brush_smooth`, `jenga`, `letters`, `marker`, `mug_tree`, `new_brush`, `plate`, the generated `task_nuts_bolts` meshes, the conveyor fixture in `task_conveyor_pick`, the baked plate/rack originals in `task_dishrack`, `tin_2` in `task_chess`, and all task-tuned MJCF wrappers and collision meshes |
+
 
 ### DINOv3 use restrictions
 

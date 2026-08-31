@@ -18,7 +18,7 @@ class DeployConfig:
     debug: bool = False
     rtc: bool = False
     rtc_prefix_length: int = 4
-    rtc_inference_lead_steps: int = 7
+    rtc_inference_lead_steps: int = 4
     execute_chunk_dim: int = 16
     compress_images: bool = False
     init_q: str = ""

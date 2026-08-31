@@ -229,9 +229,12 @@ def main(config: TrainConfig):
         output_dir.mkdir(parents=True, exist_ok=True)
     if rank == 0:
         for c, ds in zip(components, train_components):
-            prompts = sorted({task_name_to_prompt(t) for *_, t in ds.episodes})
+            prompts = sorted(
+                {p or task_name_to_prompt(t) for *_, t, p in ds.episodes}
+            )
+            shown = prompts if len(prompts) <= 5 else [*prompts[:5], f"... {len(prompts) - 5} more"]
             print(f"train[{c.train_dir}] weight={c.weight:.4f}: "
-                  f"{len(ds.episodes)} episodes, {len(ds)} usable frames, prompts={prompts}")
+                  f"{len(ds.episodes)} episodes, {len(ds)} usable frames, prompts={shown}")
         for name, ds in val_components:
             print(f"val[{name}]: {len(ds.episodes)} episodes")
         print(
@@ -333,7 +336,8 @@ def main(config: TrainConfig):
             path = output_dir / f"{global_step}.pt"
             save_checkpoint(path, module=module, optimizer=optimizer, scheduler=scheduler,
                             global_step=global_step, norm_stats=norm_stats,
-                            batch_size=config.batch_size, data_world=data_scope.world)
+                            batch_size=config.batch_size, data_world=data_scope.world,
+                            train_config=asdict(config))
             update_last(output_dir, path)
             print(f"[rank {rank}] saved {path}")
 

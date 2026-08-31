@@ -42,8 +42,7 @@ class RobotConfig:
 
 @dataclass
 class PolicyConfig:
-    # Policies were trained and the followers run at 30 Hz. Keep this exact
-    # legacy value so cleanup does not execute action chunks at double speed.
+    # Match the policy and follower 30 Hz control rate.
     dt: float = 0.03333
 
 

@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CACHE_ROOT = REPO_ROOT / "cache"
 
@@ -32,7 +31,7 @@ class OptimConfig:
 class FlowConfig:
     """Rectified-flow matching + action-prefix conditioning."""
     mask_state_ratio: float = 0.1
-    max_action_prefix: int = 4
+    max_action_prefix: int = 8
     prefix_conditioning_prob: float = 1.0
     prefix_noise_scale: float = 0.05
     num_diffusion_steps: int = 10
@@ -115,40 +114,6 @@ class DiTConfig:
     vision_pool_mlp_ratio: int = 4
 
 
-@dataclass
-class PutBottlesSimConfig:
-    """Scene, randomization, and task metric defaults for put-bottles sim eval."""
-    gripper_ctrl_max: float = 0.0475
-    bottle_count: int = 6
-    init_q: tuple[float, ...] = (
-        0.0, 1.047, 1.047, 0.0, 0.0, 0.0, 0.0,
-        0.0, 1.047, 1.047, 0.0, 0.0, 0.0, 0.0,
-    )
-    timestep: float = 0.002
-    control_decimation: int = 17
-
-    table_z: float = 0.75
-    table_bounds: tuple[float, float, float, float] = (0.3025, 0.8975, -0.65, 0.65)
-    bottle_spawn_clearance: float = 0.005
-    bottle_sample_attempts: int = 200
-    bottle_collision_margin: float = 0.04
-    bottle_scale_range: tuple[float, float] = (0.9, 1.1)
-    bottle_side_radii: tuple[float, ...] = (0.025667, 0.024014, 0.020589, 0.026359, 0.023689, 0.021823)
-    bottle_flat_lengths: tuple[float, ...] = (0.166718, 0.165000, 0.156531, 0.160000, 0.166689, 0.159200)
-    bottle_flat_half_widths: tuple[float, ...] = (0.025672, 0.024013, 0.020566, 0.025957, 0.023689, 0.021823)
-
-    bin_scale_range: tuple[float, float] = (0.95, 1.05)
-    bin_yaw_range: tuple[float, float] = (-0.75, 0.75)
-    bin_xy_range: tuple[float, float, float, float] = (0.57, 0.73, -0.25, 0.25)
-    bin_z_scale: float = 0.83
-    bin_occupied_radius: float = 0.13
-    bin_base_quat: tuple[float, float, float, float] = (0.70710678, 0.70710678, 0.0, 0.0)
-
-    eval_bin_radius: float = 0.155
-    eval_min_rel_z: float = -0.06
-    eval_max_rel_z: float = 0.26
-
-
 MIXTURE_PRESETS: dict[str, list[MixtureComponent]] = {
     "bottles": [
         MixtureComponent("train_real", "val_real", 0.8172, "throw_plastic_bottles_in_bin"),
@@ -156,6 +121,14 @@ MIXTURE_PRESETS: dict[str, list[MixtureComponent]] = {
     ],
     "tshirt": [
         MixtureComponent("train_real", "val_real", 1.0, "folding_tshirt_pile_and_stacking"),
+    ],
+    # Single-task sim finetuning: point --cache-root at a cache holding exactly
+    # one task's episodes (prepare.py --sim-data <task> into a fresh root). The
+    # component reads everything under train_sim/, and each episode's own
+    # metadata task_name drives the training prompt, so one preset serves any
+    # sim task.
+    "sim_task": [
+        MixtureComponent("train_sim", "val_sim", 1.0, ""),
     ],
 }
 
@@ -171,14 +144,12 @@ class TrainConfig:
     num_workers: int = 16
     train_steps: int = 75_000
 
-    mixture_preset: Literal["bottles", "tshirt"] = "bottles"
+    mixture_preset: Literal["bottles", "tshirt", "sim_task"] = "bottles"
     mixture: list[MixtureComponent] = field(default_factory=list)
 
     load_pretrained: bool = False
     pretrained_ckpt_name: str = "abc_dit_xl_200k_model.pt"
-    # When finetuning from a checkpoint that embeds norm_stats, use those instead
-    # of cache/norm_stats.json so inputs are scaled exactly as during pretraining.
-    inherit_ckpt_norm_stats: bool = True
+    inherit_ckpt_norm_stats: bool = True  # scale inputs with the checkpoint's own norm_stats, as during pretraining
     resume_from: str | None = None
     dino_bf16: bool = True
     compile: bool = True
@@ -202,37 +173,36 @@ class TrainConfig:
 
 @dataclass
 class SimEvalConfig:
-    """MuJoCo-Warp put-bottles evaluation."""
+    """MuJoCo-Warp sim evaluation, defaulting to the put-bottles task."""
     checkpoint: str
+    task: str = "put_plastic_bottles_in_bin"  # any abc_sim task name, alias, or prompt
     norm_stats_path: str | None = None
-    output_dir: str = field(
-        default_factory=lambda: str(
-            Path(__file__).resolve().parents[1] / "outputs" / "sim_eval_put_bottles"
-        )
-    )
+    output_dir: str | None = None  # None resolves to $REPO/outputs/sim_eval_<task>.
     num_worlds: int = 5
     seed: int = 20260511
-    num_chunks: int = 120
+    num_chunks: int = 236  # x15 actions: the production dashboard horizon; shorter under-reports long tasks
     execute_chunk_dim: int = 15
+    prefix_length: int | None = None # ignored when doing rtc
     diffusion_steps: int = 10
     policy_seed: int = 0
     camera_height: int = 168
     camera_width: int = 224
     device: str = "auto"
     gpu_id: int | None = None
+    camera_backend: Literal["mjwarp", "mujoco"] = "mjwarp"  # "mujoco" is the CPU/macOS fallback
     fast_inference: bool = True
     fast_compile_mode: str = "max-autotune"
     vanilla_physics: bool = False
-    rtc: bool = False
+    rtc: bool = True  # condition each inference on the next rtc_prefix_length unexecuted actions (prefix == lead)
     rtc_prefix_length: int = 4
     rtc_inference_lead_steps: int = 4
     log_every_chunk: bool = False
     save_video: bool = False
     video_fps: int = 30
     video_every_n_actions: int = 1
-    prompt: str = "sim put the plastic bottles in the bin"
+    # None resolves to "sim " + the task's prompt from the abc_sim spec.
+    prompt: str | None = None
 
-    scene: PutBottlesSimConfig = field(default_factory=PutBottlesSimConfig)
     clip: ClipConfig = field(default_factory=ClipConfig)
     model: DiTConfig = field(default_factory=DiTConfig)
 
@@ -240,7 +210,10 @@ class SimEvalConfig:
 @dataclass
 class VizSimEvalConfig(SimEvalConfig):
     """Single-world sim config defaults for the live Viser viewer."""
+    checkpoint: str = ""  # Empty resolves the task's cached recommended checkpoint.
     num_chunks: int = 200
+    # Synchronous viewer rollouts are unprefixed; RTC uses its own future prefix.
+    prefix_length: int | None = 0
 
 
 @dataclass
@@ -250,6 +223,30 @@ class VizPolicyConfig:
     port: int = 8080
     fast_inference: bool = True
     fast_compile_mode: str = "max-autotune"
+
+
+@dataclass
+class VizEpisodeConfig:
+    """Viser playback of downloaded dataset episodes (no policy, no torch)."""
+
+    # Play just this one episode directory.
+    episode_dir: Path | None = None
+    # Episode pool to browse, grouped by task ($ABC_CACHE/train_sim by default).
+    root: Path | None = None
+    # Start on this task (default: first task found in the pool).
+    task: str = ""
+    # Viser server port.
+    port: int = 8080
+    # pose: posed exactly from the recording — the whole scene when the episode
+    # ships scene_qpos.npy, else the 14 arm dofs with objects at their start
+    # pose. physics: recorded actions stepped open loop from the initial state.
+    mode: str = "pose"
+    # Playback speed multiplier over the 30 Hz data clock.
+    speed: float = 1.0
+    # Show the recorded combined camera video beside the 3D scene.
+    video_panel: bool = True
+    # Per-task episode dropdown cap; a full task pool holds thousands.
+    max_episodes: int = 500
 
 
 def validate_model_config(model: DiTConfig) -> list[str]:
