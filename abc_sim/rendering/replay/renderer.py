@@ -8,6 +8,11 @@ from typing import Literal
 
 import numpy as np
 
+# Model fields the task randomizers edit in place per episode. MJWarp indexes
+# them per world, so a runtime keeps one copy per world and refreshes them from
+# the MuJoCo model on reset.
+PER_EPISODE_MODEL_FIELDS = ("body_pos", "body_quat", "mat_rgba")
+
 
 def _sanitize_missing_int_fields(device_struct, cls) -> None:
     for field in dataclasses.fields(cls):
@@ -96,6 +101,12 @@ class WarpReplayRuntime:
             nconmax=nconmax,
             njmax=njmax,
         )
+        for name in PER_EPISODE_MODEL_FIELDS:
+            field = getattr(self.m_warp, name)
+            if field.size:
+                expanded = np.repeat(field.numpy(), nworld, axis=0)
+                setattr(self.m_warp, name, wp.array(expanded, dtype=field.dtype))
+        self._step_graphs: dict[int, object] = {}
         self._closed = False
 
     def close(self) -> None:
@@ -106,6 +117,7 @@ class WarpReplayRuntime:
             self._wp.synchronize()
         except Exception:
             pass
+        self._step_graphs = {}
         self.m_warp = None
         self.d_warp = None
         self.mjm = None
@@ -132,8 +144,24 @@ class WarpReplayRuntime:
             device=self.d_warp.qpos.device,
         )
 
+    def sync_model_from_mujoco(self, per_world: dict[str, np.ndarray] | None = None) -> None:
+        """Copy the per-episode model fields into every world of the Warp model.
+
+        ``per_world`` maps a field name to a ``(nworld, ...)`` array holding one
+        value per world; other fields broadcast the MuJoCo model's value.
+        """
+        for name in PER_EPISODE_MODEL_FIELDS:
+            target = getattr(self.m_warp, name)
+            if not target.size:
+                continue
+            values = None if per_world is None else per_world.get(name)
+            if values is None:
+                values = np.repeat(np.asarray(getattr(self.mjm, name))[None], self.nworld, axis=0)
+            self._copy_field(target, np.ascontiguousarray(values, dtype=np.float32), dtype=target.dtype)
+
     def sync_from_mujoco(self) -> None:
         """Copy the current MuJoCo state into the persistent Warp data."""
+        self.sync_model_from_mujoco()
         self._copy_field(
             self.d_warp.qpos,
             np.broadcast_to(
@@ -315,11 +343,16 @@ class WarpReplayRuntime:
         self._mjw.forward(self.m_warp, self.d_warp)
 
     def step(self, *, nstep: int = 1) -> None:
-        """Advance the Warp simulation state by the requested number of steps."""
+        """Advance every world by ``nstep`` substeps, replaying a captured CUDA graph."""
         if nstep < 1:
             raise ValueError(f"nstep must be >= 1, got {nstep}")
-        for _ in range(nstep):
-            self._mjw.step(self.m_warp, self.d_warp)
+        graph = self._step_graphs.get(nstep)
+        if graph is None:
+            with self._wp.ScopedCapture() as capture:
+                for _ in range(nstep):
+                    self._mjw.step(self.m_warp, self.d_warp)
+            graph = self._step_graphs[nstep] = capture.graph
+        self._wp.capture_launch(graph)
 
 
 class RendererWrapper:
@@ -500,6 +533,7 @@ class RendererWrapper:
 
         self._mjw.refit_bvh(self.m_warp, self.d_warp, self._rc)
         self._mjw.render(self.m_warp, self.d_warp, self._rc)
+        self._wp.synchronize_stream()
         img = (
             self._wp.to_torch(self._rc.rgb_data)
             .view(self._torch.uint8)

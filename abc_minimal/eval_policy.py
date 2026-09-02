@@ -63,9 +63,9 @@ class RTCManager:
 
     def _action_prefix(self, actions: np.ndarray) -> np.ndarray:
         m = self.policy.config.model
-        prefix = np.zeros((m.chunk_length, m.action_dim), dtype=np.float32)
-        executed = np.asarray(actions[: self.execute_chunk_dim], dtype=np.float32)
-        prefix[: self.prefix_length] = executed[-self.prefix_length :]
+        executed = np.asarray(actions[..., : self.execute_chunk_dim, :], dtype=np.float32)
+        prefix = np.zeros((*executed.shape[:-2], m.chunk_length, m.action_dim), dtype=np.float32)
+        prefix[..., : self.prefix_length, :] = executed[..., -self.prefix_length :, :]
         return prefix
 
     def start(
@@ -86,7 +86,7 @@ class RTCManager:
                 action_prefix=action_prefix,
                 prefix_length=self.prefix_length,
             )
-            return actions[self.prefix_length :], time.perf_counter() - t0
+            return actions[..., self.prefix_length :, :], time.perf_counter() - t0
 
         self._pending = self._executor.submit(_run)
 
@@ -277,6 +277,31 @@ def validate_rtc_config(config: SimEvalConfig) -> list[str]:
     return errors
 
 
+def validate_batched_config(config: SimEvalConfig) -> list[str]:
+    if config.parallel_worlds < 0:
+        return ["parallel_worlds must be >= 0"]
+    if config.parallel_worlds == 0:
+        return []
+    errors = []
+    if config.num_worlds % config.parallel_worlds:
+        errors.append(
+            f"num_worlds ({config.num_worlds}) must be a multiple of "
+            f"parallel_worlds ({config.parallel_worlds})"
+        )
+    if config.camera_backend != "mjwarp":
+        errors.append("--parallel-worlds renders with MJWarp; drop --camera-backend mujoco")
+    if config.vanilla_physics:
+        errors.append("--parallel-worlds steps MJWarp physics; drop --vanilla-physics")
+    return errors
+
+
+def reset_options(config: SimEvalConfig) -> dict[str, Any] | None:
+    """Env reset options carrying the --randomization request, or None."""
+    if config.randomization is None:
+        return None
+    return {"randomization": json.loads(config.randomization)}
+
+
 def checkpoint_sim_prompt(config: SimEvalConfig) -> str | None:
     """The prompt this checkpoint trained ``config.task`` under, or None.
 
@@ -439,11 +464,14 @@ def build_summary(
 
 def run_eval(config: SimEvalConfig) -> dict[str, Any]:
     model_errors = validate_model_config(config.model)
-    config_errors = model_errors + validate_rtc_config(config)
+    config_errors = (
+        model_errors + validate_rtc_config(config) + validate_batched_config(config)
+    )
     if config_errors:
         raise ValueError("Invalid sim eval config:\n  - " + "\n  - ".join(config_errors))
 
     require_mjwarp()
+    options = reset_options(config)
     config = replace(
         config,
         prompt=resolve_prompt(config),
@@ -464,7 +492,16 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
         f"(checkpoint max_action_prefix={policy.trained_max_prefix})",
         flush=True,
     )
-    env = _make_env(config)
+    out_dir = Path(config.output_dir).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if config.parallel_worlds:
+        from abc_minimal.batched_eval import make_batched_env, rollout_batched_worlds
+
+        env = make_batched_env(config)
+        rollout = rollout_batched_worlds
+    else:
+        env = _make_env(config)
+        rollout = rollout_worlds
     physics = resolved_physics(env)
     if physics is not None:
         print(
@@ -473,10 +510,28 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
             f"control={physics['control_hz']:.2f}Hz",
             flush=True,
         )
+    worlds = rollout(config, policy, env, prefix_length, options, out_dir)
+    return build_summary(
+        config=config,
+        ckpt_path=ckpt_path,
+        device=device,
+        worlds=worlds,
+        out_dir=out_dir,
+        physics=physics,
+    )
+
+
+def rollout_worlds(
+    config: SimEvalConfig,
+    policy: SimPolicy,
+    env: SimTaskEnv,
+    prefix_length: int,
+    options: dict[str, Any] | None,
+    out_dir: Path,
+) -> list[dict[str, Any]]:
+    """Roll out the worlds one at a time in CPU MuJoCo; returns their records."""
     rng = np.random.default_rng(config.policy_seed)
     worlds = []
-    out_dir = Path(config.output_dir).expanduser().resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
     fast_inference_ready = False
     rtc_warmup_ready = False
     action_shape = (config.model.chunk_length, config.model.action_dim)
@@ -491,20 +546,20 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
             t0 = time.perf_counter()
             seed = int(config.seed + world_index)
             try:
-                obs = env.reset(seed=seed)
+                obs = env.reset(seed=seed, options=options)
             except RandomizationSamplingError:
                 # The carried arm pose from the previous episode can block a
                 # seed that places fine from init_q; retry from init_q before
                 # resampling so the run keeps its world count.
                 env.forget_arm_state()
                 try:
-                    obs = env.reset(seed=seed)
+                    obs = env.reset(seed=seed, options=options)
                     print(f"world={world_index:03d} unplaceable from the carried "
                           "arm pose, placed from init_q")
                 except RandomizationSamplingError:
                     seed = int(config.seed + world_index + 100_000)
                     print(f"world={world_index:03d} unplaceable seed, resampled -> {seed}")
-                    obs = env.reset(seed=seed)
+                    obs = env.reset(seed=seed, options=options)
             if config.fast_inference and not fast_inference_ready:
                 warmup_rng = np.random.default_rng(config.policy_seed)
                 warmup_noise = sample_noise(warmup_rng)
@@ -708,15 +763,7 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
             )
     finally:
         env.close()
-
-    return build_summary(
-        config=config,
-        ckpt_path=ckpt_path,
-        device=device,
-        worlds=worlds,
-        out_dir=out_dir,
-        physics=physics,
-    )
+    return worlds
 
 
 def main(config: SimEvalConfig) -> None:

@@ -387,7 +387,8 @@ class SceneRandomizer:
     ) -> RandomizationState:
         """Sample a collision-free placement, apply it to data, and return state."""
         rng = np.random.default_rng(seed)
-        scale_states = self._sample_scale_states(rng)
+        randomize_scales = request.get("randomize_scales", True) if isinstance(request, dict) else True
+        scale_states = self._sample_scale_states(rng) if randomize_scales else {}
         self._current_scale_states = dict(scale_states)
         if scale_states:
             self._reload_scene_for_scale_states(scale_states)

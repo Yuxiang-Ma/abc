@@ -362,6 +362,14 @@ class MuJoCoYAMEnv(gym.Env):
                 )
                 if trash_joints is not None:
                     self._task_evaluator.set_active_trash_joints(trash_joints)
+            if self._last_randomization is not None and hasattr(
+                self._task_evaluator, "set_active_object_joints"
+            ):
+                active_joints = getattr(self._last_randomization, "metadata", {}).get(
+                    "active_object_joints"
+                )
+                if active_joints is not None:
+                    self._task_evaluator.set_active_object_joints(active_joints)
 
         self.cur_step = 0
         info: dict[str, Any] = {}

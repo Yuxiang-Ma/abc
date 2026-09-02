@@ -47,6 +47,19 @@ class LegoBlocksSortingEvaluator:
     def reset(self, *, nworld: int = 1) -> None:
         self._nworld = int(nworld)
         self._ever_success = np.zeros((self._nworld,), dtype=bool)
+        self._active = {
+            color: np.ones((self._nworld, len(names)), dtype=bool)
+            for color, names in self.block_names.items()
+        }
+
+    def set_active_object_joints(self, active_joints_by_world: Any) -> None:
+        """Score only each world's active blocks; the rest sit parked off the table."""
+        if self._nworld == 1 and active_joints_by_world and isinstance(active_joints_by_world[0], str):
+            active_joints_by_world = [active_joints_by_world]
+        for world, joints in enumerate(active_joints_by_world):
+            active = set(joints)
+            for color, names in self.block_names.items():
+                self._active[color][world] = [f"{name}_joint" in active for name in names]
 
     @staticmethod
     def _resolve_block_qpos_addrs(
@@ -125,22 +138,23 @@ class LegoBlocksSortingEvaluator:
         num_correct = np.zeros((qpos_batch.shape[0],), dtype=np.int32)
         num_wrong_bin = np.zeros((qpos_batch.shape[0],), dtype=np.int32)
         metrics: dict[str, np.ndarray] = {}
-        total_blocks = 0
+        total_blocks = np.zeros((qpos_batch.shape[0],), dtype=np.int32)
         for color in _LEGO_COLORS:
             positions = np.stack(
                 [qpos_batch[:, addr : addr + 3] for addr in self._block_qpos_addrs[color]],
                 axis=1,
             )
-            in_matching_bin = self._inside_bin(positions, qpos_batch, color)
+            active = self._active[color]
+            in_matching_bin = active & self._inside_bin(positions, qpos_batch, color)
             color_sorted = in_matching_bin.sum(axis=1).astype(np.int32)
             metrics[f"num_{color}_sorted"] = color_sorted
             num_correct += color_sorted
-            total_blocks += len(self.block_names[color])
+            total_blocks += active.sum(axis=1)
 
             for other_color in _LEGO_COLORS:
                 if other_color == color:
                     continue
-                num_wrong_bin += self._inside_bin(positions, qpos_batch, other_color).sum(
+                num_wrong_bin += (active & self._inside_bin(positions, qpos_batch, other_color)).sum(
                     axis=1
                 ).astype(np.int32)
 
@@ -154,7 +168,7 @@ class LegoBlocksSortingEvaluator:
             }
         )
         return TaskEvalResult(
-            reward=(num_correct.astype(np.float32) / float(total_blocks)),
+            reward=(num_correct / np.maximum(total_blocks, 1)).astype(np.float32),
             success=success,
             metrics=metrics,
         )

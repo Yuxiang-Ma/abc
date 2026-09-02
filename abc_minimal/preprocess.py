@@ -89,6 +89,25 @@ def resize_pad_normalize(img_chw, target_h=224, target_w=224, preset="imagenet")
     return normalize_image(x, preset=preset)
 
 
+def resize_pad_normalize_batch(img_bchw, target_h=224, target_w=224, preset="imagenet"):
+    """resize_pad_normalize over a (B, 3, H, W) uint8 batch, on the batch's own device."""
+    x = torch.as_tensor(img_bchw)
+    if not torch.is_floating_point(x):
+        x = x.float() / 255.0
+    _, _, h, w = x.shape
+    if (h, w) != (target_h, target_w):
+        ratio = max(w / target_w, h / target_h)
+        new_h = max(1, int(round(h / ratio)))
+        new_w = max(1, int(round(w / ratio)))
+        x = F.interpolate(
+            x, size=(new_h, new_w), mode="bilinear", align_corners=False, antialias=True
+        )
+        pad_h0 = (target_h - new_h) // 2
+        pad_w0 = (target_w - new_w) // 2
+        x = F.pad(x, (pad_w0, target_w - new_w - pad_w0, pad_h0, target_h - new_h - pad_h0), value=0)
+    return normalize_image(x, preset=preset)
+
+
 def _rotate(img_hwc, angle_deg):
     """Rotate (H,W,C) with reflection padding."""
     if abs(angle_deg) < 0.1:

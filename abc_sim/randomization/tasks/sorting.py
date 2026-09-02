@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path as _Path
 from typing import Any
 
+import mujoco
 import numpy as np
 
 from ..assets.paths import _MODELS_DIR
@@ -57,6 +58,7 @@ class _VariableCountSortingRandomizer(_ScaleAwareTabletopRandomizer):
     base_scene_xml_path: _Path
     bin_body_names: tuple[str, ...] = ()
     candidate_object_body_names: tuple[str, ...] = ()
+    _parked_joints: tuple[str, ...] = ()
 
     def __init__(self) -> None:
         super().__init__()
@@ -93,6 +95,7 @@ class _VariableCountSortingRandomizer(_ScaleAwareTabletopRandomizer):
         *,
         body_pose_source_names: dict[str, str] | None = None,
         bin_visual_styles: dict[str, str] | None = None,
+        park_inactive: bool = False,
     ) -> None:
         active_body_names = (*self.bin_body_names, *active_object_body_names)
         active_joint_names = {self._body_to_joint_name(body_name) for body_name in active_body_names}
@@ -115,13 +118,19 @@ class _VariableCountSortingRandomizer(_ScaleAwareTabletopRandomizer):
             base_dir = self.base_scene_xml_path.parent
             base_transformed = False
 
+        scene_object_names = self.candidate_object_body_names if park_inactive else active_object_body_names
         xml = _filter_sorting_scene_xml(
             base_xml,
             candidate_object_body_names=self.candidate_object_body_names,
-            active_object_body_names=active_object_body_names,
-            home_body_names=active_body_names,
+            active_object_body_names=scene_object_names,
+            home_body_names=(*self.bin_body_names, *scene_object_names),
             body_pose_source_names=body_pose_source_names,
             bin_visual_styles=bin_visual_styles,
+        )
+        self._parked_joints = tuple(
+            self._body_to_joint_name(name)
+            for name in scene_object_names
+            if name not in active_object_body_names
         )
         if self._scene_xml_transform_options is not None and not base_transformed:
             xml = _count_box_apply_scene_transforms(xml, self._scene_xml_transform_options)
@@ -132,6 +141,29 @@ class _VariableCountSortingRandomizer(_ScaleAwareTabletopRandomizer):
         self._base_scene_xml_transformed = base_transformed
         self._fixed_body_nominals = None
 
+    def _parked_states(self) -> dict[str, dict[str, list[float]]]:
+        """Parking on the table plane behind the robot for the candidates an episode leaves out."""
+        return {
+            joint_name: {"pos": [-1.5 - 0.1 * index, 0.4, 0.76], "quat": [1.0, 0.0, 0.0, 0.0]}
+            for index, joint_name in enumerate(self._parked_joints)
+        }
+
+    def _before_sampling(self, model: Any, data: Any) -> None:
+        for joint_name, pose in self._parked_states().items():
+            joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+            adr = model.jnt_qposadr[joint_id]
+            data.qpos[adr : adr + 7] = [*pose["pos"], *pose["quat"]]
+        if self._parked_joints:
+            mujoco.mj_forward(model, data)
+
+    def _reload_configured_scene(self) -> None:
+        env = self._env_ref
+        preserved_arm_state = env._get_reset_arm_state()
+        env.reload_from_xml(self._scene_xml_for_scale_states({}))
+        mujoco.mj_resetData(env.model, env.data)
+        env._set_qpos_from_state(preserved_arm_state)
+        mujoco.mj_forward(env.model, env.data)
+
     def randomize(
         self,
         model: Any,
@@ -140,15 +172,26 @@ class _VariableCountSortingRandomizer(_ScaleAwareTabletopRandomizer):
         request: Any | None = None,
     ) -> RandomizationState:
         rng = np.random.default_rng(seed)
+        options = request if isinstance(request, dict) else {}
         active_object_body_names, metadata = self._sample_active_object_body_names(rng)
         body_pose_source_names = self._sample_body_pose_source_names(active_object_body_names, rng)
-        bin_visual_styles = _sample_bin_visual_styles(self.bin_body_names, rng)
+        style = options.get("bin_visual_style")
+        bin_visual_styles = (
+            {name: str(style) for name in self.bin_body_names}
+            if style
+            else _sample_bin_visual_styles(self.bin_body_names, rng)
+        )
         self._configure_active_scene(
             active_object_body_names,
             body_pose_source_names=body_pose_source_names,
             bin_visual_styles=bin_visual_styles,
+            park_inactive=bool(options.get("park_inactive", False)),
         )
+        if not options.get("randomize_scales", True):
+            self._reload_configured_scene()
+            model, data = self._env_ref.model, self._env_ref.data
         state = super().randomize(model, data, seed=seed, request=request)
+        state.object_states.update(self._parked_states())
         state.metadata.update(metadata)
         state.metadata["active_object_joints"] = [
             self._body_to_joint_name(body_name) for body_name in active_object_body_names

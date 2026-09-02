@@ -176,6 +176,12 @@ uv run eval_policy.py \
 #   summary.json     — success_rate, num_success, mean_reward,
 #                      mean_max_progress, mean_max_bottles_in_bin
 #   world_*.mp4      — per-world rollout videos (with --save-video)
+
+# 100 worlds stepped together in MJWarp physics (see the abc_sim README).
+uv run eval_policy.py \
+    --checkpoint cache/bottles_75k.pt \
+    --num-worlds 100 --parallel-worlds 100 \
+    --randomization '{"bottle_count": 6, "randomize_variants": false, "randomize_scales": false}'
 ```
 
 Any catalogue task is selected by name with `--task`. The task list, eval

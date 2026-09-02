@@ -14,6 +14,7 @@ task randomization, and new sim environments all work from this package alone.
 - [Rewards and Success](#rewards-and-success)
 - [Sim Eval](#sim-eval)
   - [Eval flags](#eval-flags)
+  - [Batched eval](#batched-eval)
   - [Scored tasks](#scored-tasks)
   - [The put-bottles task and its aliases](#the-put-bottles-task-and-its-aliases)
   - [Prompt defaults](#prompt-defaults)
@@ -218,6 +219,12 @@ the horizon the production sim-eval dashboard measured checkpoints with).
 - `--rtc` / `--no-rtc` (default on) — RTC evaluation: each inference receives
 the next `--rtc-prefix-length` (default 4) not-yet-executed actions and overlaps
 inference with their execution. `--no-rtc` runs a synchronous loop.
+- `--parallel-worlds N` — step N worlds together in MJWarp physics (default
+0: one CPU MuJoCo world at a time). `--num-worlds` must be a multiple of N;
+see [Batched eval](#batched-eval).
+- `--randomization JSON` — reset request for the task randomizer, applied to
+every world, e.g. `'{"bottle_count": 6, "randomize_variants": false,
+"randomize_scales": false}'` (fields: `abc_sim/randomization/requests.py`).
 - `--diffusion-steps N` — flow-matching Euler steps per inference
 (default 10, matches production).
 - `--checkpoint` — path to the `.pt` checkpoint to evaluate.
@@ -235,6 +242,27 @@ Note that the first launch compiles MJWarp's CUDA kernels (~1 min).
 `--camera-backend mujoco` renders with CPU MuJoCo instead of MJWarp: slow, but
 it runs anywhere MuJoCo does, which makes it the way to smoke-test on a laptop
 (including macOS). On a headless Linux box, set `MUJOCO_GL=egl`.
+
+### Batched eval
+
+`--parallel-worlds N` steps N worlds together in MJWarp physics with one
+batched policy call per chunk; RTC, prefix conditioning, `--save-video`, and
+`summary.json` are unchanged. A batch shares one compiled model, so pin the
+randomization that would recompile it (object counts, variants, scales) with
+`--randomization`; poses and colors still vary per world. The sorting tasks
+batch with `{"park_inactive": true, "bin_visual_style": "stackable"}`, which
+keeps every candidate object in the scene and parks the unused ones behind
+the robot. Tasks with a per-step runtime (conveyor pick, ball tray, multi-drawer search) and evaluators
+that need MjData or per-episode targets are sequential-only.
+
+MJWarp is a different physics engine: absolute success rates differ from the
+CPU MuJoCo loop (put-bottles with the 200k policy: 0.71–0.77 batched vs 0.54
+sequential on the same pinned scenes), runs are not seed-reproducible, and every
+world starts from the home pose. Compare checkpoints within one backend.
+
+On one H100 a 100-world put-bottles eval takes about 8 minutes after a one-off
+compile per batch width (~15 min cold, ~1 min cached), against about an hour
+sequentially; the ray-traced render (~7 ms per world per chunk) is the ceiling.
 
 ### Scored tasks
 

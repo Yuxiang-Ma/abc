@@ -324,9 +324,37 @@ def make_env(
     return env
 
 
+def make_batched_env(
+    task: str,
+    *,
+    num_worlds: int,
+    prompt: str | None = None,
+    camera_height: int = 480,
+    camera_width: int = 640,
+    camera_gpu_id: int | None = None,
+    **kwargs,
+):
+    """Create ``num_worlds`` copies of a task scene stepped together in MJWarp.
+
+    The CPU env built by :func:`make_env` still owns the task's randomizer and
+    resets each world; physics and camera rendering run batched on the GPU.
+    """
+    from abc_sim.batched_env import BatchedWarpYAMEnv
+
+    base_env = make_env(task=task, prompt=prompt, render_cameras=False, **kwargs)
+    return BatchedWarpYAMEnv(
+        base_env,
+        num_worlds=num_worlds,
+        camera_height=camera_height,
+        camera_width=camera_width,
+        gpu_id=camera_gpu_id,
+    )
+
+
 __all__ = [
     "MuJoCoYAMEnv",
     "make_env",
+    "make_batched_env",
     "get_i2rt_sim_config",
     "get_i2rt_config",
     "RobotSystemConfig",

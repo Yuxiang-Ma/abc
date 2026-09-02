@@ -72,8 +72,8 @@ class SimTaskEnv:
             camera_width=width,
         )
 
-    def reset(self, seed: int) -> dict[str, Any]:
-        obs, info = self.env.reset(seed=seed, randomize=True)
+    def reset(self, seed: int, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        obs, info = self.env.reset(seed=seed, options=options, randomize=True)
         self.randomization = info.get("randomization")
         return self._policy_obs(obs)
 

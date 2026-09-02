@@ -49,6 +49,17 @@ class NutsBoltsSortingEvaluator:
     def reset(self, *, nworld: int = 1) -> None:
         self._nworld = int(nworld)
         self._ever_success = np.zeros((self._nworld,), dtype=bool)
+        self._active_nuts = np.ones((self._nworld, len(self.nut_names)), dtype=bool)
+        self._active_bolts = np.ones((self._nworld, len(self.bolt_names)), dtype=bool)
+
+    def set_active_object_joints(self, active_joints_by_world: Any) -> None:
+        """Score only each world's active parts; the rest sit parked off the table."""
+        if self._nworld == 1 and active_joints_by_world and isinstance(active_joints_by_world[0], str):
+            active_joints_by_world = [active_joints_by_world]
+        for world, joints in enumerate(active_joints_by_world):
+            active = set(joints)
+            self._active_nuts[world] = [f"{name}_joint" in active for name in self.nut_names]
+            self._active_bolts[world] = [f"{name}_joint" in active for name in self.bolt_names]
 
     @staticmethod
     def _resolve_part_qpos_addrs(
@@ -139,28 +150,28 @@ class NutsBoltsSortingEvaluator:
             axis=1,
         )
 
-        nuts_in_nuts_bin = self._inside_bin(
+        nuts_in_nuts_bin = self._active_nuts & self._inside_bin(
             nut_positions,
             qpos_batch,
             self._nuts_bin_qpos_addr,
             self._nuts_goal_local_center,
             self._nuts_goal_size,
         )
-        bolts_in_bolts_bin = self._inside_bin(
+        bolts_in_bolts_bin = self._active_bolts & self._inside_bin(
             bolt_positions,
             qpos_batch,
             self._bolts_bin_qpos_addr,
             self._bolts_goal_local_center,
             self._bolts_goal_size,
         )
-        nuts_in_bolts_bin = self._inside_bin(
+        nuts_in_bolts_bin = self._active_nuts & self._inside_bin(
             nut_positions,
             qpos_batch,
             self._bolts_bin_qpos_addr,
             self._bolts_goal_local_center,
             self._bolts_goal_size,
         )
-        bolts_in_nuts_bin = self._inside_bin(
+        bolts_in_nuts_bin = self._active_bolts & self._inside_bin(
             bolt_positions,
             qpos_batch,
             self._nuts_bin_qpos_addr,
@@ -172,7 +183,7 @@ class NutsBoltsSortingEvaluator:
         num_bolts_sorted = bolts_in_bolts_bin.sum(axis=1).astype(np.int32)
         num_nuts_inverted = nuts_in_bolts_bin.sum(axis=1).astype(np.int32)
         num_bolts_inverted = bolts_in_nuts_bin.sum(axis=1).astype(np.int32)
-        total_parts = len(self.nut_names) + len(self.bolt_names)
+        total_parts = self._active_nuts.sum(axis=1) + self._active_bolts.sum(axis=1)
         # Two ways to partition the parts over the two bins; each rollout is
         # scored by whichever it is closer to, and succeeds on completing
         # either. A part in the wrong bin *for that orientation* counts
@@ -189,7 +200,7 @@ class NutsBoltsSortingEvaluator:
         )
 
         return TaskEvalResult(
-            reward=(num_correct.astype(np.float32) / float(total_parts)),
+            reward=(num_correct / np.maximum(total_parts, 1)).astype(np.float32),
             success=success,
             metrics={
                 "num_nuts_sorted": num_nuts_sorted,

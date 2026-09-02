@@ -190,6 +190,8 @@ class SimEvalConfig:
     device: str = "auto"
     gpu_id: int | None = None
     camera_backend: Literal["mjwarp", "mujoco"] = "mjwarp"  # "mujoco" is the CPU/macOS fallback
+    parallel_worlds: int = 0  # >0: step this many worlds together in MJWarp physics; 0: one CPU MuJoCo world at a time
+    randomization: str | None = None  # JSON reset request for the task randomizer, applied to every world
     fast_inference: bool = True
     fast_compile_mode: str = "max-autotune"
     vanilla_physics: bool = False

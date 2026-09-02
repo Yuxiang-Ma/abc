@@ -16,6 +16,7 @@ from abc_minimal.preprocess import (
     parse_norm_stats,
     preset_for_backbone,
     resize_pad_normalize,
+    resize_pad_normalize_batch,
     unnormalize,
 )
 
@@ -59,7 +60,13 @@ def resolve_trained_max_prefix(ckpt: dict[str, Any]) -> int:
 
 
 class DiTInferencePolicy:
-    """Checkpoint-backed DiT inference shared by sim and deploy adapters."""
+    """Checkpoint-backed DiT inference shared by sim and deploy adapters.
+
+    ``infer`` takes one observation (state ``(S,)``, images ``(3, H, W)``) or a
+    batch of worlds (state ``(B, S)``, images ``(B, 3, H, W)`` as numpy arrays
+    or CUDA tensors, one prompt or one per world) and returns one action chunk
+    per world.
+    """
 
     def __init__(self, checkpoint: Path, config: Any, device: str):
         self.config = config
@@ -145,13 +152,13 @@ class DiTInferencePolicy:
     ) -> np.ndarray:
         m = self.config.model
         prefix = np.asarray(action_prefix, dtype=np.float32)
-        if prefix.shape == (prefix_length, m.action_dim):
-            full_prefix = np.zeros((m.chunk_length, m.action_dim), dtype=np.float32)
-            full_prefix[:prefix_length] = prefix
+        if prefix.shape[-2:] == (prefix_length, m.action_dim):
+            full_prefix = np.zeros((*prefix.shape[:-2], m.chunk_length, m.action_dim), dtype=np.float32)
+            full_prefix[..., :prefix_length, :] = prefix
             prefix = full_prefix
-        if prefix.shape != (m.chunk_length, m.action_dim):
+        if prefix.shape[-2:] != (m.chunk_length, m.action_dim):
             raise ValueError(
-                f"action_prefix must have shape {(m.chunk_length, m.action_dim)} "
+                f"action_prefix must end in shape {(m.chunk_length, m.action_dim)} "
                 f"or {(prefix_length, m.action_dim)}, got {prefix.shape}"
             )
         return normalize(prefix, self.norm_stats["actions"]).astype(
@@ -165,7 +172,8 @@ class DiTInferencePolicy:
         prefix_length: int,
     ) -> None:
         m = self.config.model
-        action_prefix = np.zeros((m.chunk_length, m.action_dim), dtype=np.float32)
+        leading = np.shape(obs["state"])[:-1]
+        action_prefix = np.zeros((*leading, m.chunk_length, m.action_dim), dtype=np.float32)
         warmup_replays = 8 if self._fast_inference_enabled else 1
         for _ in range(warmup_replays):
             self.infer(
@@ -185,40 +193,56 @@ class DiTInferencePolicy:
         action_prefix: np.ndarray | None = None,
         prefix_length: int | None = 0,
     ) -> np.ndarray:
-        self.set_prompt(str(obs.get("prompt", self._prompt)))
         if action_prefix is not None and prefix_length is None:
-            prefix_length = len(action_prefix)
+            prefix_length = np.shape(action_prefix)[-2]
         prefix_length = int(prefix_length or 0)
-        state = normalize(
-            np.asarray(obs["state"], dtype=np.float32), self.norm_stats["state"]
-        )
-        batch = {
-            "state": torch.from_numpy(state[None]).float().to(self.device),
-            "actions": torch.zeros(
-                1,
-                self.config.model.chunk_length,
-                self.config.model.action_dim,
-                device=self.device,
-            ),
-            "images": {
+        m = self.config.model
+        state = np.asarray(obs["state"], dtype=np.float32)
+        batched = state.ndim == 2
+        prompt = obs.get("prompt", self._prompt)
+        if batched:
+            prompts = [prompt] * len(state) if isinstance(prompt, str) else list(prompt)
+            task_vec = self.embedder.encode(prompts).to(
+                device=self.device, dtype=self.task_vec.dtype
+            )
+            images = {
+                cam: resize_pad_normalize_batch(
+                    torch.as_tensor(obs["images"][cam]).to(self.device), preset=self.norm_preset
+                )
+                for cam in m.camera_keys
+            }
+        else:
+            self.set_prompt(str(prompt))
+            task_vec = self.task_vec
+            images = {
                 cam: resize_pad_normalize(obs["images"][cam], preset=self.norm_preset)
                 .unsqueeze(0)
                 .to(self.device)
-                for cam in self.config.model.camera_keys
-            },
-            "task_vec_clip": self.task_vec,
+                for cam in m.camera_keys
+            }
+        state = normalize(state, self.norm_stats["state"]).reshape(-1, m.state_dim)
+        num_worlds = len(state)
+        batch = {
+            "state": torch.from_numpy(state).to(self.device),
+            "actions": torch.zeros(num_worlds, m.chunk_length, m.action_dim, device=self.device),
+            "images": images,
+            "task_vec_clip": task_vec,
         }
         noise_t = None
         if noise is not None:
-            noise_t = torch.from_numpy(noise[None].astype(np.float32)).to(self.device)
+            noise_arr = np.asarray(noise, dtype=np.float32).reshape(
+                num_worlds, m.chunk_length, m.action_dim
+            )
+            noise_t = torch.from_numpy(noise_arr).to(self.device)
         if action_prefix is None:
             actions = self.model.sample_actions(
                 batch, num_steps=self.diffusion_steps, noise=noise_t
             )
         else:
-            prefix_t = torch.from_numpy(
-                self.normalized_action_prefix(action_prefix, prefix_length)[None]
-            ).to(device=self.device, dtype=batch["state"].dtype)
+            prefix = self.normalized_action_prefix(action_prefix, prefix_length).reshape(
+                num_worlds, m.chunk_length, m.action_dim
+            )
+            prefix_t = torch.from_numpy(prefix).to(device=self.device, dtype=batch["state"].dtype)
             actions = self.model.sample_actions_rtc(
                 batch,
                 prefix_t,
@@ -226,5 +250,6 @@ class DiTInferencePolicy:
                 num_steps=self.diffusion_steps,
                 noise=noise_t,
             )
-        actions_np = actions[0].float().detach().cpu().numpy()
-        return unnormalize(actions_np, self.norm_stats["actions"]).astype(np.float32)
+        actions_np = actions.float().detach().cpu().numpy()
+        actions_np = unnormalize(actions_np, self.norm_stats["actions"]).astype(np.float32)
+        return actions_np if batched else actions_np[0]
