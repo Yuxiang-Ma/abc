@@ -10,7 +10,7 @@ from abc_sim.rendering.replay.camera_providers import (
 )
 
 
-LiveRenderBackend = Literal["mujoco", "mjwarp", "madrona"]
+LiveRenderBackend = Literal["mujoco", "mjwarp", "madrona", "blender"]
 
 
 def create_live_camera_provider(
@@ -24,6 +24,17 @@ def create_live_camera_provider(
     camera_names: tuple[str, ...] | None = None,
 ):
     """Create a live camera renderer for the current MuJoCo state."""
+    if backend == "blender":
+        from abc_sim.rendering.blender.live import BlenderCameraProvider
+
+        return BlenderCameraProvider(
+            model,
+            data,
+            width=width,
+            height=height,
+            gpu_id=gpu_id,
+            camera_names=camera_names,
+        )
     if backend == "mujoco":
         return MujocoCameraProvider(
             model,

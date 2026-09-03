@@ -239,7 +239,8 @@ compatibility.
 
 Note that the first launch compiles MJWarp's CUDA kernels (~1 min).
 
-`--camera-backend mujoco` renders with CPU MuJoCo instead of MJWarp: slow, but
+`--camera-backend mujoco` renders with CPU MuJoCo instead of MJWarp (`blender`
+renders with Cycles, see [Rendering](#rendering)): slow, but
 it runs anywhere MuJoCo does, which makes it the way to smoke-test on a laptop
 (including macOS). On a headless Linux box, set `MUJOCO_GL=egl`.
 
@@ -567,6 +568,14 @@ Supported paths:
 - `camera_backend="mujoco"`: standard MuJoCo renderer for local/single-env
   rendering. Requires a working OpenGL context.
 - `camera_backend="mjwarp"`: GPU renderer used by policy evaluation.
+- `camera_backend="blender"`: path-traced (Blender Cycles) renders of the same
+  cameras, one Blender process per environment, for evaluating policies under a
+  photoreal domain. About 190 ms per three-camera observation at 224x168 on an
+  H100 (16 samples, denoised) plus ~4 s of startup per reset, so one world at a
+  time. Needs a Blender 4.2+ binary (`BLENDER=/path/to/blender`), `usd-core` in
+  the Python environment and optionally `ABC_HDRI` for a studio HDRI;
+  `ABC_BLENDER_SAMPLES` / `ABC_BLENDER_DENOISER` trade quality for speed. See
+  [abc_sim/rendering/blender/README.md](rendering/blender/README.md).
 - `camera_backend="madrona"`: not supported in this release. The Madrona
   renderer needs a build that is not part of the public package, so use
   `mujoco` or `mjwarp` instead.

@@ -54,18 +54,25 @@ def _quat_to_rotmat_batch(quat_batch: np.ndarray) -> np.ndarray:
 
 
 class MugFlipUprightEvaluator:
-    """Score mug flip by requiring every spawned mug to be right-side-up."""
+    """Score mug flip by requiring every spawned mug to be right-side-up and back at rest.
+
+    A mug counts once its axis is within ~18 degrees of vertical (``upright_z_min``) and it sits no more than
+    ``max_lift_m`` above the height it had at the first evaluation, so a mug still in the gripper mid-flip does not.
+    """
 
     def __init__(
         self,
         *,
         model: mujoco.MjModel,
         spec: SimTaskSpec,
-        upright_z_min: float = 0.75,
+        upright_z_min: float = 0.95,
+        max_lift_m: float = 0.03,
     ) -> None:
         self.model = model
         self.spec = spec
         self.upright_z_min = float(upright_z_min)
+        self.max_lift_m = float(max_lift_m)
+        self._rest_height: np.ndarray | None = None
         self.mug_names, self._mug_qpos_addrs = self._resolve_mug_qpos_addrs(model)
         self.success_count = len(self.mug_names)
         self._nworld = 1
@@ -76,6 +83,7 @@ class MugFlipUprightEvaluator:
         self._nworld = int(nworld)
         self._max_upright_mugs = np.zeros((self._nworld,), dtype=np.int32)
         self._ever_success = np.zeros((self._nworld,), dtype=bool)
+        self._rest_height = None
 
     @staticmethod
     def _resolve_mug_qpos_addrs(model: mujoco.MjModel) -> tuple[list[str], np.ndarray]:
@@ -139,7 +147,10 @@ class MugFlipUprightEvaluator:
         )
         local_z_world = mug_rot[..., :, 2]
         upright_z = local_z_world[..., 2]
-        upright_mask = upright_z >= self.upright_z_min
+        height = np.stack([qpos_batch[:, adr + 2] for adr in self._mug_qpos_addrs], axis=1)
+        if self._rest_height is None:
+            self._rest_height = height.copy()
+        upright_mask = (upright_z >= self.upright_z_min) & (height <= self._rest_height + self.max_lift_m)
 
         num_upright = upright_mask.sum(axis=1).astype(np.int32)
         active_count = np.full(
@@ -164,6 +175,7 @@ class MugFlipUprightEvaluator:
             "mug_upright_mask": upright_mask,
             "mug_upright_z": upright_z.astype(np.float32),
             "min_mug_upright_z": upright_z.min(axis=1).astype(np.float32),
+            "mug_lift_m": (height - self._rest_height).astype(np.float32),
             "upright_mugs": upright_mugs,
             "mug_names": list(self.mug_names),
             "success_count": len(self.mug_names),

@@ -233,6 +233,8 @@ def make_env(
         env = MuJoCoYAMEnv(
             config=config,
             render_cameras=render_cameras,
+            camera_backend=camera_backend,
+            camera_gpu_id=camera_gpu_id,
             prompt=resolved_prompt,
             chunk_dim=chunk_dim,
             scene_xml=None,
