@@ -2,7 +2,7 @@
 
 A single loop drives both policies, selected by ``config.policy``:
   * ``"dit"`` — the CLIP/DINOv3 ABC-DiT policy (default).
-  * ``"vla"`` — the Gemma-3 diffusion VLA.
+  * ``"vla"`` — ABC-VLA.
 Both share this distributed setup, optimizer/scheduler, validation, and
 checkpoint format; the policy only changes model construction, how a batch is
 conditioned, and the training/sampling forward calls.

@@ -1,4 +1,4 @@
-"""Adapt the Gemma/SigLIP diffusion VLA to the deploy protocol.
+"""Adapt ABC-VLA to the deploy protocol.
 
 Mirrors dit_policy.py. Everything specific to the VLA lives in
 abc_minimal.policy.VLAInferencePolicy; VLAPolicyConfig is re-exported from

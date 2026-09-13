@@ -1,4 +1,4 @@
-"""Gemma 3 diffusion VLA: a Gemma/SigLIP context encoder feeding a DiT action head."""
+"""ABC-VLA: a Gemma/SigLIP context encoder feeding a DiT action head."""
 
 from __future__ import annotations
 

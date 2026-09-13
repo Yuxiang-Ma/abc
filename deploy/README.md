@@ -34,7 +34,7 @@ Then run the robot side with `--remote-host=<gpu-host>`. Add
 
 ## VLA inference
 
-The Gemma/SigLIP diffusion VLA is served through the same websocket protocol;
+ABC-VLA is served through the same websocket protocol;
 `serve_policy.py` auto-detects the checkpoint type (`--policy-type` forces it):
 
 ```bash

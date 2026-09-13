@@ -22,7 +22,7 @@ dependencies = [
     "av",
     "ftfy",
     "regex",
-    # Gemma 3 tokenizer used by the diffusion VLA.
+    # Gemma 3 tokenizer used by ABC-VLA.
     "sentencepiece>=0.2.0",
     # tyro powers the dataclass CLI configs.
     "tyro",

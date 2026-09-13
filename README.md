@@ -14,12 +14,12 @@
 Code for the ABC project.
 
 > Note: we have released a minimal ABC-DiT training and real-robot deployment
-> pipeline, data conversion and simulation tools, and the focused diffusion VLA
+> pipeline, data conversion and simulation tools, and the focused ABC-VLA
 > implementation documented below.
 
 ## Release status
 
-This release includes ABC-DiT and diffusion VLA training, pretrained and
+This release includes ABC-DiT and ABC-VLA training, pretrained and
 task-finetuned checkpoints, simulation and evaluation tools, real-robot
 deployment, and data conversion utilities. Use `prepare.py --sim-data-list`
 to see the currently published simulation datasets and
@@ -324,8 +324,8 @@ cases. Bundled license texts live under `assets/third_party/`.
 | [OpenAI CLIP](https://github.com/openai/CLIP) | MIT | [`assets/third_party/clip/LICENSE`](assets/third_party/clip/LICENSE) | Adapted (`abc_minimal/dit.py`); ViT-B/32 text weights + BPE vocab downloaded at runtime | CLIP text encoder + BPE tokenizer (`CLIPBPETokenizer`, `CLIPTextTower`, `CLIPTextEmbedder`) |
 | [openpi](https://github.com/Physical-Intelligence/openpi) | Apache 2.0 | [`assets/third_party/openpi/LICENSE`](assets/third_party/openpi/LICENSE) | Adapted (`deploy/client/websocket_client_policy.py`, `deploy/client/msgpack_numpy.py`) | Websocket inference client skeleton + msgpack NumPy serialization |
 | [msgpack-numpy](https://github.com/lebedov/msgpack-numpy) | BSD 3-Clause | [`assets/third_party/msgpack_numpy/LICENSE.md`](assets/third_party/msgpack_numpy/LICENSE.md) | Adapted (`deploy/client/msgpack_numpy.py`, via openpi) | NumPy serialization strategy for msgpack |
-| [Gemma](https://ai.google.dev/gemma) | Apache 2.0 (code); Gemma Terms of Use (weights) | [`assets/third_party/gemma/LICENSE`](assets/third_party/gemma/LICENSE) | Adapted (`abc_minimal/gemma/`); base checkpoint supplied by the user | Gemma 3 model + SentencePiece tokenizer for the diffusion VLA |
-| [SigLIP](https://github.com/google-research/big_vision) | Apache 2.0 | [`assets/third_party/gemma/LICENSE`](assets/third_party/gemma/LICENSE) | Adapted (`abc_minimal/gemma/siglip_vision/`) | SigLIP vision encoder for the diffusion VLA |
+| [Gemma](https://ai.google.dev/gemma) | Apache 2.0 (code); Gemma Terms of Use (weights) | [`assets/third_party/gemma/LICENSE`](assets/third_party/gemma/LICENSE) | Adapted (`abc_minimal/gemma/`); base checkpoint supplied by the user | Gemma 3 model + SentencePiece tokenizer for ABC-VLA |
+| [SigLIP](https://github.com/google-research/big_vision) | Apache 2.0 | [`assets/third_party/gemma/LICENSE`](assets/third_party/gemma/LICENSE) | Adapted (`abc_minimal/gemma/siglip_vision/`) | SigLIP vision encoder for ABC-VLA |
 
 ### Gemma weights terms of use
 

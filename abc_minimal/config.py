@@ -141,7 +141,7 @@ MIXTURE_PRESETS: dict[str, list[MixtureComponent]] = {
 @dataclass
 class TrainConfig:
     """Minimal ABC training: the CLIP/DINOv3 ABC-DiT policy (default) or the
-    Gemma-3 diffusion VLA, selected with ``--policy {dit,vla}``. Both share this
+    ABC-VLA, selected with ``--policy {dit,vla}``. Both share this
     single entry point (``train.py``), training loop, optimizer/scheduler,
     validation, and checkpoint format; ``--policy vla`` swaps in the Gemma
     backbone (``--vla-model.*``) and enables the VLA-only optim/flow knobs."""
@@ -198,7 +198,7 @@ class TrainConfig:
 
 @dataclass
 class GemmaVLAConfig:
-    """Gemma 3 4B/SigLIP backbone settings for the diffusion VLA."""
+    """Gemma 3 4B/SigLIP backbone settings for ABC-VLA."""
     checkpoint: str | None = None
     load_base_checkpoint: bool = True
     image_size: int = 224
