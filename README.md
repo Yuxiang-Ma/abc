@@ -17,14 +17,17 @@ Code for the ABC project.
 > pipeline, data conversion and simulation tools, and the focused diffusion VLA
 > implementation documented below.
 
-## Release Roadmap
-- [x] June 17 -- Release Minimal Training Pipeline
-- [ ] Sep 1 -- Release all sim data  (sorry for the delay!)
-- [ ] Sep 1 -- full code release
+## Release status
+
+This release includes ABC-DiT and diffusion VLA training, pretrained and
+task-finetuned checkpoints, simulation and evaluation tools, real-robot
+deployment, and data conversion utilities. Use `prepare.py --sim-data-list`
+to see the currently published simulation datasets and
+`prepare.py --sim-bundle-list` to browse available evaluation bundles.
 
 ## Repo layout
 
-This README is a quickstart for local training — the package READMEs above hold the full reference for their areas.
+This README covers setup, a short evaluation smoke test, and training. The package READMEs below hold the full reference for their areas.
 
 | Package | What it holds |
 | --- | --- |
@@ -35,6 +38,12 @@ This README is a quickstart for local training — the package READMEs above hol
 `train.py`, `eval_policy.py`, `viz_episode.py`, `viz_policy.py`, and `prepare.py` at the root are the entrypoints; `scripts/` holds the data conversion utilities.
 
 ## Setup
+
+The training and default GPU evaluation commands below target Linux with an
+NVIDIA GPU and a driver compatible with CUDA 12.8 (the pinned PyTorch build).
+Use Python 3.12. The reference DiT training run uses 8 H100/H200 GPUs with
+80 GB VRAM each; reduce the GPU count and per-GPU `--batch-size` for smaller
+machines. Minimum evaluation VRAM has not been established.
 
 ```bash
 # Install uv if you don't have it.
@@ -47,11 +56,37 @@ sudo apt-get install -y ffmpeg     # on Linux
 ```
 
 ```bash
-# Pin Python and create the project venv. uv reads pyproject.toml here.
+git clone https://github.com/amazon-far/abc.git
 cd abc
+# Pin Python and create the project venv. uv reads pyproject.toml here.
 uv python pin 3.12
 uv sync
 ```
+
+## Quick evaluation smoke test
+
+After setup, download the bottles checkpoint (~8.1 GB), preview data, and its
+simulation assets, then run one short rollout on a single NVIDIA GPU:
+
+```bash
+uv run prepare.py --checkpoint
+uv run eval_policy.py \
+    --checkpoint "${ABC_CACHE:-cache}/bottles_75k.pt" \
+    --num-worlds 1 --num-chunks 2 --no-fast-inference \
+    --save-video --video-every-n-actions 15
+```
+
+The checkpoint includes its vision backbone and normalization statistics;
+no separate DINO weight download is needed for this evaluation. The first
+launch compiles MJWarp CUDA kernels (approximately one minute); download and
+rollout times depend on your connection and GPU. This short run skips the
+optional inference compilation.
+
+Expect `summary.json` and a `world_*.mp4` video under
+`outputs/sim_eval_put_plastic_bottles_in_bin/`. Completing the run checks
+checkpoint loading, rendering, and policy inference. Two action chunks are
+too short to measure task success; use the full [evaluation](#evaluation)
+instructions for that.
 
 ## Training
 
@@ -101,8 +136,9 @@ If you have fewer GPUs than 8 you need to reduce nproc per node or if you have l
 
 A diffusion-only port of the Gemma 3 VLA: Gemma 3 4B with SigLIP at 224x224, one
 selectable Gemma feature layer, QK-normalized learned-query pooling, a state token
-plus optional direct state conditioning, and a small AdaLN DiT head. FAST tokens,
-the alternative conditioners, and the FSDP stack are not included.
+plus optional direct state conditioning, and a small AdaLN DiT head. FAST tokens
+and the alternative conditioners are not included. VLA training supports FSDP
+with the restrictions described below.
 
 Training from the Gemma base needs Google's `gemma_pytorch` checkpoint
 (`google/gemma-3/pyTorch/gemma-3-4b-pt` on Kaggle, under the Gemma Terms of Use);
@@ -118,7 +154,8 @@ uv run torchrun --standalone --nproc-per-node 8 train.py \
 The `--prompt.*` subtask and operator options apply to the VLA as to the DiT;
 neither has been validated for it. `--fsdp` shards parameters, gradients, and
 Adam state across the ranks instead of replicating them, roughly halving
-per-GPU memory on two GPUs.
+per-GPU memory on two GPUs. Launch with `torchrun --nproc-per-node` greater
+than 1; `--fsdp` is VLA-only and cannot be combined with `--compile-siglip`.
 
 ### Finetuning from a released checkpoint
 
@@ -248,8 +285,9 @@ hardware dependencies with `uv sync --extra deploy`.
 
 ## Episode exports & training data format
 
-While we host a single task in training format, there are many more in the ABC
-Dataset. The ABC-130k MCAPs are hosted on Hugging Face at
+The quickstart real-data download covers the bottles task; simulation data for
+additional tasks is available through `prepare.py --sim-data-list`. To prepare
+other real-data tasks, the ABC-130k MCAPs are hosted on Hugging Face at
 [`XDOF/ABC-130k`](https://huggingface.co/datasets/XDOF/ABC-130k) (the dataset
 is gated, so accept access on the dataset page and set `HF_TOKEN`). Download
 all MCAPs for one task and convert them in place:
@@ -264,10 +302,17 @@ sharded downloads, and subtask/operator conditioning are documented in the
 
 ## Licenses
 
-The code in this repository is Apache-2.0 ([`LICENSE`](LICENSE)), and so are the
-model weights we publish — both `bottles_75k.pt` and `abc_dit_xl_200k_model.pt`.
+The project code is Apache-2.0 ([`LICENSE`](LICENSE)), with third-party
+components covered by the licenses listed below. The published DiT checkpoints
+`bottles_75k.pt` and `abc_dit_xl_200k_model.pt` are Apache-2.0.
 Both checkpoints embed a DINOv3-derived vision backbone, so the DINOv3 use
 restrictions below apply to the weights as well as to the code that loads them.
+
+The released VLA checkpoints (including `vla_abc130k_200000_v2.pt`, the
+`abc130k` and `200k` families, and their task finetunes) contain Gemma-derived
+weights and are subject to the [Gemma Terms of Use](https://ai.google.dev/gemma/terms),
+including its use and redistribution conditions. See [Gemma weights terms of
+use](#gemma-weights-terms-of-use) below.
 
 This repository includes and adapts code from the following third-party
 projects. Original license files and copyright headers are retained in all
@@ -286,10 +331,12 @@ cases. Bundled license texts live under `assets/third_party/`.
 
 Gemma model code is Apache-2.0, but Gemma *weights* are additionally governed by
 the Google Gemma Terms of Use (https://ai.google.dev/gemma/terms), including its
-Prohibited Use Policy. The base Gemma 3 checkpoint is an explicit, user-supplied
-input to `train.py --policy vla` and is not distributed with this repository; downstream
-users who obtain and load Gemma weights through this codebase are responsible for
-complying with those terms. See `assets/third_party/gemma/NOTICE` for details.
+Prohibited Use Policy. Training from the base Gemma 3 checkpoint requires a
+user-supplied file; the base checkpoint is not bundled in this repository.
+The released VLA checkpoints downloaded by `prepare.py` contain Gemma-derived
+weights, so those terms also apply when finetuning or evaluating them without
+a separate base checkpoint. See `assets/third_party/gemma/NOTICE` and the
+[Gemma Terms of Use](https://ai.google.dev/gemma/terms) for details.
 
 ### Simulator asset licenses
 
