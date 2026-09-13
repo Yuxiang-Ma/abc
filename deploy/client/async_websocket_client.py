@@ -42,11 +42,9 @@ class RTCInferenceManager:
         self,
         client: AsyncWebsocketClientPolicy,
         prefix_length: int = 5,
-        inference_lead_steps: int = 10,
     ) -> None:
         self.client = client
         self.prefix_length = prefix_length
-        self.inference_lead_steps = inference_lead_steps
         self._pending: Future | None = None
         self._start_ts: float | None = None
         self._end_ts: float | None = None
@@ -68,7 +66,6 @@ class RTCInferenceManager:
             prefix = actions[-self.prefix_length :]
             request["action_prefix"] = prefix
             request["prefix_length"] = len(prefix)
-            request["latency"] = self.inference_lead_steps - self.prefix_length
 
         self._start_ts = time.perf_counter()
         self._pending = self.client.infer_async(request)

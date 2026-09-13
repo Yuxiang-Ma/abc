@@ -1,15 +1,22 @@
-"""Reusable ABC-DiT inference policy for simulation and real deployment."""
+"""Reusable ABC-DiT and VLA inference policies for sim and real deployment."""
 
 from __future__ import annotations
 
 import json
+import warnings
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 
-from abc_minimal.config import FlowConfig
+from abc_minimal.checkpointing import model_state_dict
+from abc_minimal.config import (
+    FlowConfig,
+    VLAModelConfig,
+    validate_vla_checkpoint_config,
+)
 from abc_minimal.dit import CLIPTextEmbedder, DiTPolicy, load_pretrained
 from abc_minimal.preprocess import (
     normalize,
@@ -19,6 +26,7 @@ from abc_minimal.preprocess import (
     resize_pad_normalize_batch,
     unnormalize,
 )
+from abc_minimal.vla import VLAPolicy, inference_model_config, stack_camera_batch
 
 
 def resolve_norm_stats(ckpt: dict[str, Any], override: str | None) -> dict[str, Any]:
@@ -59,47 +67,25 @@ def resolve_trained_max_prefix(ckpt: dict[str, Any]) -> int:
     return FlowConfig().max_action_prefix
 
 
-class DiTInferencePolicy:
-    """Checkpoint-backed DiT inference shared by sim and deploy adapters.
+class InferencePolicy:
+    """Prefix conditioning and RTC warmup shared by the DiT and VLA policies."""
 
-    ``infer`` takes one observation (state ``(S,)``, images ``(3, H, W)``) or a
-    batch of worlds (state ``(B, S)``, images ``(B, 3, H, W)`` as numpy arrays
-    or CUDA tensors, one prompt or one per world) and returns one action chunk
-    per world.
-    """
-
-    def __init__(self, checkpoint: Path, config: Any, device: str):
-        self.config = config
-        self.device = torch.device(device)
-        self.diffusion_steps = config.diffusion_steps
-        self.model = DiTPolicy(config.model).to(self.device)
-        ckpt = load_pretrained(self.model, checkpoint)
-        self.model.eval()
-        self.norm_preset = preset_for_backbone(config.model.vision_backbone)
-        self.norm_stats = resolve_norm_stats(ckpt, config.norm_stats_path)
-        self.trained_max_prefix = resolve_trained_max_prefix(ckpt)
-        self.embedder = CLIPTextEmbedder(config.clip, device=self.device)
-        self._prompt = config.prompt
-        self.task_vec = self.embedder.encode([self._prompt]).to(self.device)
-        self._fast_inference_enabled = False
-
-    def set_prompt(self, prompt: str) -> None:
-        if prompt == self._prompt:
-            return
-        self._prompt = prompt
-        self.task_vec = self.embedder.encode([prompt]).to(
-            device=self.device, dtype=self.model.x_embedder.weight.dtype
-        )
+    fast_rtc_warmup_replays = 1
+    fast_inference_replay_warmups = 1
 
     def enable_fast_inference(
         self,
         compile_mode: str = "max-autotune",
-        replay_warmups: int = 24,
+        replay_warmups: int | None = None,
         warmup_obs: dict[str, Any] | None = None,
         warmup_noise: np.ndarray | None = None,
         rtc_prefix_length: int | None = None,
     ) -> None:
-        """Cast to bf16 and compile the default graph-break-free samplers."""
+        """Compile the model's hot path and warm it so rollouts skip the JIT cost.
+
+        The compile step differs per policy (see ``_compile_for_fast_inference``);
+        the CUDA/TF32 setup and the warmup that forces compilation are shared.
+        """
         if self._fast_inference_enabled:
             return
         if self.device.type != "cuda":
@@ -109,22 +95,14 @@ class DiTInferencePolicy:
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
 
-        self.model.to(torch.bfloat16)
-        self.model.img_backbone.set_bfloat16(True)
-        self.task_vec = self.task_vec.to(device=self.device, dtype=torch.bfloat16)
-
-        compile_kwargs: dict[str, Any] = {"dynamic": False, "fullgraph": True}
-        if compile_mode:
-            compile_kwargs["mode"] = compile_mode
-        self.model.sample_actions = torch.compile(
-            self.model.sample_actions, **compile_kwargs
-        )
-        self.model.sample_actions_rtc = torch.compile(
-            self.model.sample_actions_rtc, **compile_kwargs
-        )
+        self._compile_for_fast_inference(compile_mode)
         self._fast_inference_enabled = True
 
-        m = self.config.model
+        # torch.compile is lazy: without this warmup the first real inference
+        # of a rollout pays the compilation cost.
+        if replay_warmups is None:
+            replay_warmups = self.fast_inference_replay_warmups
+        m = self.model_config
         if warmup_obs is None:
             warmup_obs = {
                 "state": np.zeros(m.state_dim, dtype=np.float32),
@@ -141,25 +119,32 @@ class DiTInferencePolicy:
             warmup_noise = np.zeros((m.chunk_length, m.action_dim), dtype=np.float32)
         for _ in range(max(1, replay_warmups)):
             self.infer(warmup_obs, noise=warmup_noise)
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(self.device)
         if rtc_prefix_length is not None:
             self.warmup_rtc(warmup_obs, warmup_noise, rtc_prefix_length)
+
+    def _compile_for_fast_inference(self, compile_mode: str) -> None:
+        """Compile the policy-specific hot path. Implemented by each subclass."""
+        raise NotImplementedError
 
     def normalized_action_prefix(
         self,
         action_prefix: np.ndarray,
         prefix_length: int,
     ) -> np.ndarray:
-        m = self.config.model
+        """Pad a prefix to a full chunk and normalize it (leading batch dims ok)."""
+        chunk_length, action_dim = self.chunk_length, self.action_dim
         prefix = np.asarray(action_prefix, dtype=np.float32)
-        if prefix.shape[-2:] == (prefix_length, m.action_dim):
-            full_prefix = np.zeros((*prefix.shape[:-2], m.chunk_length, m.action_dim), dtype=np.float32)
+        if prefix.shape[-2:] == (prefix_length, action_dim):
+            full_prefix = np.zeros(
+                (*prefix.shape[:-2], chunk_length, action_dim), dtype=np.float32
+            )
             full_prefix[..., :prefix_length, :] = prefix
             prefix = full_prefix
-        if prefix.shape[-2:] != (m.chunk_length, m.action_dim):
+        if prefix.shape[-2:] != (chunk_length, action_dim):
             raise ValueError(
-                f"action_prefix must end in shape {(m.chunk_length, m.action_dim)} "
-                f"or {(prefix_length, m.action_dim)}, got {prefix.shape}"
+                f"action_prefix must end in shape {(chunk_length, action_dim)} "
+                f"or {(prefix_length, action_dim)}, got {prefix.shape}"
             )
         return normalize(prefix, self.norm_stats["actions"]).astype(
             np.float32, copy=False
@@ -171,11 +156,13 @@ class DiTInferencePolicy:
         noise: np.ndarray | None,
         prefix_length: int,
     ) -> None:
-        m = self.config.model
+        """Warm the prefix-conditioned sampler that RTC rollouts replay."""
         leading = np.shape(obs["state"])[:-1]
-        action_prefix = np.zeros((*leading, m.chunk_length, m.action_dim), dtype=np.float32)
-        warmup_replays = 8 if self._fast_inference_enabled else 1
-        for _ in range(warmup_replays):
+        action_prefix = np.zeros(
+            (*leading, self.chunk_length, self.action_dim), dtype=np.float32
+        )
+        replays = self.fast_rtc_warmup_replays if self._fast_inference_enabled else 1
+        for _ in range(replays):
             self.infer(
                 obs,
                 noise=noise,
@@ -183,7 +170,62 @@ class DiTInferencePolicy:
                 prefix_length=prefix_length,
             )
         if self.device.type == "cuda":
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(self.device)
+
+
+class DiTInferencePolicy(InferencePolicy):
+    """Checkpoint-backed DiT inference shared by sim and deploy adapters.
+
+    ``infer`` takes one observation (state ``(S,)``, images ``(3, H, W)``) or a
+    batch of worlds (state ``(B, S)``, images ``(B, 3, H, W)`` as numpy arrays
+    or CUDA tensors, one prompt or one per world) and returns one action chunk
+    per world.
+    """
+
+    fast_rtc_warmup_replays = 8  # compiled samplers are graph-replayed
+    fast_inference_replay_warmups = 24
+
+    def __init__(self, checkpoint: Path, config: Any, device: str, model_config: Any = None):
+        self.config = config
+        self.model_config = model_config if model_config is not None else config.model
+        self.device = torch.device(device)
+        self.diffusion_steps = config.diffusion_steps
+        self.chunk_length = self.model_config.chunk_length
+        self.action_dim = self.model_config.action_dim
+        self.model = DiTPolicy(self.model_config).to(self.device)
+        ckpt = load_pretrained(self.model, checkpoint)
+        self.model.eval()
+        self.norm_preset = preset_for_backbone(self.model_config.vision_backbone)
+        self.norm_stats = resolve_norm_stats(ckpt, config.norm_stats_path)
+        self.trained_max_prefix = resolve_trained_max_prefix(ckpt)
+        self.embedder = CLIPTextEmbedder(config.clip, device=self.device)
+        self._prompt = config.prompt
+        self.task_vec = self.embedder.encode([self._prompt]).to(self.device)
+        self._fast_inference_enabled = False
+
+    def set_prompt(self, prompt: str) -> None:
+        if prompt == self._prompt:
+            return
+        self._prompt = prompt
+        self.task_vec = self.embedder.encode([prompt]).to(
+            device=self.device, dtype=self.model.x_embedder.weight.dtype
+        )
+
+    def _compile_for_fast_inference(self, compile_mode: str) -> None:
+        """Cast to bf16 and compile the default graph-break-free samplers."""
+        self.model.to(torch.bfloat16)
+        self.model.img_backbone.set_bfloat16(True)
+        self.task_vec = self.task_vec.to(device=self.device, dtype=torch.bfloat16)
+
+        compile_kwargs: dict[str, Any] = {"dynamic": False, "fullgraph": True}
+        if compile_mode:
+            compile_kwargs["mode"] = compile_mode
+        self.model.sample_actions = torch.compile(
+            self.model.sample_actions, **compile_kwargs
+        )
+        self.model.sample_actions_rtc = torch.compile(
+            self.model.sample_actions_rtc, **compile_kwargs
+        )
 
     @torch.no_grad()
     def infer(
@@ -196,18 +238,21 @@ class DiTInferencePolicy:
         if action_prefix is not None and prefix_length is None:
             prefix_length = np.shape(action_prefix)[-2]
         prefix_length = int(prefix_length or 0)
-        m = self.config.model
+        m = self.model_config
         state = np.asarray(obs["state"], dtype=np.float32)
         batched = state.ndim == 2
         prompt = obs.get("prompt", self._prompt)
         if batched:
-            prompts = [prompt] * len(state) if isinstance(prompt, str) else list(prompt)
+            prompts = (
+                [prompt] * len(state) if isinstance(prompt, str) else list(prompt)
+            )
             task_vec = self.embedder.encode(prompts).to(
                 device=self.device, dtype=self.task_vec.dtype
             )
             images = {
                 cam: resize_pad_normalize_batch(
-                    torch.as_tensor(obs["images"][cam]).to(self.device), preset=self.norm_preset
+                    torch.as_tensor(obs["images"][cam]).to(self.device),
+                    preset=self.norm_preset,
                 )
                 for cam in m.camera_keys
             }
@@ -224,7 +269,9 @@ class DiTInferencePolicy:
         num_worlds = len(state)
         batch = {
             "state": torch.from_numpy(state).to(self.device),
-            "actions": torch.zeros(num_worlds, m.chunk_length, m.action_dim, device=self.device),
+            "actions": torch.zeros(
+                num_worlds, m.chunk_length, m.action_dim, device=self.device
+            ),
             "images": images,
             "task_vec_clip": task_vec,
         }
@@ -239,10 +286,12 @@ class DiTInferencePolicy:
                 batch, num_steps=self.diffusion_steps, noise=noise_t
             )
         else:
-            prefix = self.normalized_action_prefix(action_prefix, prefix_length).reshape(
-                num_worlds, m.chunk_length, m.action_dim
+            prefix = self.normalized_action_prefix(
+                action_prefix, prefix_length
+            ).reshape(num_worlds, m.chunk_length, m.action_dim)
+            prefix_t = torch.from_numpy(prefix).to(
+                device=self.device, dtype=batch["state"].dtype
             )
-            prefix_t = torch.from_numpy(prefix).to(device=self.device, dtype=batch["state"].dtype)
             actions = self.model.sample_actions_rtc(
                 batch,
                 prefix_t,
@@ -250,6 +299,161 @@ class DiTInferencePolicy:
                 num_steps=self.diffusion_steps,
                 noise=noise_t,
             )
+        actions_np = actions.float().detach().cpu().numpy()
+        actions_np = unnormalize(actions_np, self.norm_stats["actions"]).astype(
+            np.float32
+        )
+        return actions_np if batched else actions_np[0]
+
+
+@dataclass
+class InferenceConfig:
+    """Everything an inference policy reads except its architecture."""
+
+    checkpoint_path: str = ""
+    norm_stats_path: str | None = None
+    """Only needed for checkpoints without embedded stats."""
+    prompt: str = "throw plastic bottles in bin"
+    diffusion_steps: int = 10
+    device: str = "auto"
+    deterministic: bool = False
+    fast_inference: bool = False
+    fast_compile_mode: str = "max-autotune"
+    rtc_prefix_length: int | None = None
+    camera_height: int = 480
+    camera_width: int = 640
+
+
+def shared_inference_fields(config: Any) -> dict[str, Any]:
+    """Pull the InferenceConfig fields off any config carrying them."""
+    return {f.name: getattr(config, f.name) for f in fields(InferenceConfig)}
+
+
+@dataclass
+class VLAPolicyConfig(InferenceConfig):
+    """The config the deploy adapter hands VLAInferencePolicy.
+
+    Sim eval and the viewer pass SimEvalConfig directly with ``model_config``.
+    """
+
+    model: VLAModelConfig = field(default_factory=VLAModelConfig)
+
+
+class VLAInferencePolicy(InferencePolicy):
+    """Checkpoint-backed VLA inference shared by sim and deploy adapters.
+
+    Same contract as DiTInferencePolicy, different conditioning: raw-string
+    prompts (no CLIP embedding, so no set_prompt), raw [0, 1] images stacked
+    into one tensor, and one sample_actions taking the RTC prefix as kwargs.
+    """
+
+    def __init__(self, checkpoint: Path, config: Any, device: str, model_config: Any = None):
+        self.config = config
+        self.model_config = model_config if model_config is not None else config.model
+        self.device = torch.device(device)
+        self.diffusion_steps = config.diffusion_steps
+        self.camera_keys = tuple(self.model_config.camera_keys)
+        self.chunk_length = self.model_config.chunk_length
+        self.action_dim = self.model_config.action_dim
+
+        checkpoint = Path(checkpoint).expanduser().resolve()
+        ckpt = torch.load(
+            checkpoint, map_location="cpu", weights_only=False, mmap=True
+        )
+        # Check the architecture before building 4B parameters of it.
+        if not validate_vla_checkpoint_config(
+            self.model_config, ckpt, source=str(checkpoint)
+        ):
+            warnings.warn(
+                "VLA checkpoint has no architecture metadata; only tensor keys "
+                "and shapes can be validated",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        self.model = VLAPolicy(
+            inference_model_config(self.model_config),
+            backbone_dtype=torch.bfloat16,
+            backbone_autocast=False,
+        ).to(self.device)
+        self.model.load_state_dict(model_state_dict(ckpt), strict=True)
+        self.model.eval()
+        self.norm_stats = resolve_norm_stats(ckpt, config.norm_stats_path)
+        self.trained_max_prefix = resolve_trained_max_prefix(ckpt)
+        self._fast_inference_enabled = False
+
+    fast_rtc_warmup_replays = 4
+    fast_inference_replay_warmups = 4
+
+    def _compile_for_fast_inference(self, compile_mode: str) -> None:
+        """Compile SigLIP, the Gemma decoder, and the head's velocity network.
+
+        Every shape is static (fixed_seq_len tokens, chunk_length actions), so
+        graph replay removes the ~3k kernel launches that dominate at batch 1.
+        """
+        kwargs: dict[str, Any] = {"dynamic": False, "mode": compile_mode or None}
+        gemma = self.model.vla.gemma_model
+        gemma.siglip_vision_model.forward = torch.compile(  # type: ignore[method-assign]
+            gemma.siglip_vision_model.forward, **kwargs
+        )
+        gemma.model.forward = torch.compile(gemma.model.forward, **kwargs)  # type: ignore[method-assign]
+        head = self.model.diffusion_head
+        head.predict_velocity = torch.compile(head.predict_velocity, **kwargs)  # type: ignore[method-assign]
+
+    @torch.no_grad()
+    def infer(
+        self,
+        obs: dict[str, Any],
+        noise: np.ndarray | None = None,
+        action_prefix: np.ndarray | None = None,
+        prefix_length: int | None = 0,
+    ) -> np.ndarray:
+        if action_prefix is not None and prefix_length is None:
+            prefix_length = np.shape(action_prefix)[-2]
+        prefix_length = int(prefix_length or 0)
+        state = normalize(
+            np.asarray(obs["state"], dtype=np.float32), self.norm_stats["state"]
+        )
+        batched = state.ndim == 2
+        state = state.reshape(-1, state.shape[-1])
+        num_worlds = len(state)
+        prompt = obs.get("prompt", self.config.prompt)
+        if batched and not isinstance(prompt, str):
+            prompts = [str(item) for item in prompt]
+        else:
+            prompts = [str(prompt)] * num_worlds
+        image_size = self.model_config.backbone.image_size
+        images = {}
+        for cam in self.camera_keys:
+            image = torch.as_tensor(obs["images"][cam]).to(self.device)
+            # resize_pad_normalize_batch rescales integer dtypes only, so a float
+            # source must already be in [0, 1]. Every producer hands over uint8.
+            images[cam] = resize_pad_normalize_batch(
+                image if batched else image[None], image_size, image_size, preset=None
+            )
+        batch = stack_camera_batch(
+            {
+                "state": torch.from_numpy(state).to(self.device),
+                "images": images,
+                "prompt": prompts,
+            },
+            self.camera_keys,
+        )
+        noise_t = None
+        if noise is not None:
+            noise_arr = np.asarray(noise, dtype=np.float32).reshape(
+                num_worlds, self.chunk_length, self.action_dim
+            )
+            noise_t = torch.from_numpy(noise_arr).to(self.device)
+        prefix_kwargs: dict[str, Any] = {}
+        if action_prefix is not None:
+            prefix = self.normalized_action_prefix(action_prefix, prefix_length).reshape(
+                num_worlds, self.chunk_length, self.action_dim
+            )
+            prefix_kwargs["action_prefix"] = torch.from_numpy(prefix).to(self.device)
+            prefix_kwargs["prefix_length"] = prefix_length
+        actions = self.model.sample_actions(
+            batch, num_steps=self.diffusion_steps, noise=noise_t, **prefix_kwargs
+        )
         actions_np = actions.float().detach().cpu().numpy()
         actions_np = unnormalize(actions_np, self.norm_stats["actions"]).astype(np.float32)
         return actions_np if batched else actions_np[0]

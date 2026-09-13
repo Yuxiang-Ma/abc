@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from deploy.deploy_config import DeployConfig
+from deploy.deploy_config import DEFAULT_PROMPT, DeployConfig
 
 
 @dataclass
@@ -32,7 +32,7 @@ class DaggerConfig(DeployConfig):
         from deploy.robot.gym.dagger_rollout import DaggerRolloutConfig
 
         return DaggerRolloutConfig(
-            prompt=self.prompt or "throw plastic bottles in bin",
+            prompt=self.prompt or DEFAULT_PROMPT,
             debug=self.debug,
             execute_chunk_dim=self.execute_chunk_dim,
             host=self.remote_host or "0.0.0.0",

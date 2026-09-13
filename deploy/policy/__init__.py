@@ -1,4 +1,4 @@
-"""DiT-only real-robot policy adapter."""
+"""Real-robot policy adapters: the DiT pair here, the VLA pair in vla_policy."""
 
 from deploy.policy.dit_policy import Policy, PolicyConfig
 

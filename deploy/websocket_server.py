@@ -23,14 +23,12 @@ def infer_observation(policy, obs: dict) -> dict:
         obs["images"] = decompress_images(obs["images"])
     action_prefix = obs.pop("action_prefix", None)
     prefix_length = obs.pop("prefix_length", None)
-    latency = obs.pop("latency", None)
     noise = obs.pop("noise", None)
     return policy.infer(
         obs,
         noise=noise,
         action_prefix=action_prefix,
         prefix_length=prefix_length,
-        latency=latency,
     )
 
 

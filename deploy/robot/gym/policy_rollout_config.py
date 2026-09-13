@@ -23,8 +23,8 @@ class PolicyRolloutConfig:
     host: str = "0.0.0.0"
     port: int = 8000
 
-    pedal_control: bool = False
-    """Pedal-controlled state machine (start/stop/reset via recorder pedals)."""
+    recorder_control: bool = False
+    """Recorder-driven state machine (start/stop/reset via recorder keys)."""
 
     direct_episode_keys: bool = False
     """Rollout-owned keyboard episode control for runs without a recorder:

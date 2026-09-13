@@ -13,8 +13,8 @@
 `abc_minimal` is the training and inference package for ABC-DiT: the model and
 its DINOv3/CLIP backbones (`dit.py`), the episode dataloader (`dataloader.py`,
 `episode_io.py`, `preprocess.py`), the training loop and checkpointing
-(`train_loop.py`, `checkpointing.py`), policy inference (`policy.py`,
-`fast_inference.py`), the sim-eval glue (`sim_env.py`, `eval_policy.py`), and
+(`train_loop.py`, `checkpointing.py`), DiT and VLA policy inference
+(`policy.py`), the sim-eval glue (`sim_env.py`, `eval_policy.py`), and
 the episode/policy visualizers. The scripts at the repository root —
 `train.py`, `eval_policy.py`, `viz_episode.py`, `viz_policy.py` — are thin
 wrappers around this package.
@@ -156,7 +156,7 @@ episode_<uuid>/
   then copy the combined manifest to every node at the same path and pass it
   via `--prompt.operator-label-map-path`.
 
-Both are off by default. Some episodes do not have eg. subtask annotations and 
+Both are off by default. Some episodes do not have eg. subtask annotations and
 for these training will drop back to task prompt only.
 
 (We intend to release the global manifest in future but this is TODO.)

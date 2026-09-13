@@ -10,7 +10,6 @@ import json
 import os
 import shutil
 import sys
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -21,6 +20,8 @@ from typing import Annotated, Literal
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import tyro
+
+from prepare import download_url
 
 
 HF, REPO = "https://huggingface.co", "XDOF/ABC-130k"
@@ -91,7 +92,8 @@ def read_json(url: str, tok: str | None):
         return json.loads(r.read()), r.headers.get("Link")
 
 
-def list_mcaps(cfg: Config, split: str, tok: str | None) -> list[dict]:
+def list_files(cfg: Config, split: str, tok: str | None, suffix: str) -> list[dict]:
+    """List every file under the task/split whose path ends with ``suffix``."""
     path = f"data/{split}/{cfg.task}"
     url = f"{HF}/api/datasets/{cfg.repo_id}/tree/{cfg.revision}/{quote(path)}?recursive=1&expand=1"
     out = []
@@ -102,10 +104,14 @@ def list_mcaps(cfg: Config, split: str, tok: str | None) -> list[dict]:
         out += [
             {"path": e["path"], "size": int(e.get("size") or 0)}
             for e in payload
-            if e.get("type") == "file" and e.get("path", "").endswith("/episode.mcap")
+            if e.get("type") == "file" and e.get("path", "").endswith(suffix)
         ]
         url = next_page(link)
-    out = sorted(out, key=lambda e: e["path"])
+    return sorted(out, key=lambda e: e["path"])
+
+
+def list_mcaps(cfg: Config, split: str, tok: str | None) -> list[dict]:
+    out = list_files(cfg, split, tok, "/episode.mcap")
     return out[: cfg.max_episodes] if cfg.max_episodes is not None else out
 
 
@@ -122,34 +128,27 @@ def split_root(cfg: Config, split: str) -> Path:
 
 
 def local_path(root: Path, item: dict) -> Path:
+    # Preserve the source filename so annotation.mcap lands beside its
+    # episode.mcap (the converter reads subtasks from that sibling file).
     p = Path(item["path"]).parts
-    return root / p[2] / p[3] / "episode.mcap"
+    return root / p[2] / p[3] / p[-1]
 
 
 def download(cfg: Config, tok: str | None, item: dict, root: Path) -> None:
     episode = Path(item["path"]).parts[3]
-    dst = local_path(root, item)
-    if dst.exists() and dst.stat().st_size == item["size"]:
-        print(f"[skip] {episode} ({fmt(item['size'])})")
-        return
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_suffix(".mcap.part")
     url = f"{HF}/datasets/{cfg.repo_id}/resolve/{cfg.revision}/{quote(item['path'])}"
-    start, done = time.monotonic(), 0
-    with open_hf(url, tok) as r, open(tmp, "wb") as f:
-        while chunk := r.read(8 << 20):
-            f.write(chunk)
-            done += len(chunk)
-            print(f"\r[get] {episode} {fmt(done)}/{fmt(item['size'])}", end="")
-    print(f"  {time.monotonic() - start:.1f}s")
-    if item["size"] and tmp.stat().st_size != item["size"]:
-        got = tmp.stat().st_size
-        tmp.unlink(missing_ok=True)
-        raise RuntimeError(f"incomplete download for {item['path']}: {got} != {item['size']}")
-    tmp.rename(dst)
+    download_url(
+        url,
+        local_path(root, item),
+        expected=item["size"] or None,
+        require_size=False,
+        headers=headers(tok),
+        label=episode,
+    )
 
 
-def write_manifest(cfg: Config, split: str, files: list[dict], root: Path) -> None:
+def write_manifest(cfg: Config, split: str, files: list[dict],
+                   annotations: list[dict], root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
     data = {
         "repo_id": cfg.repo_id,
@@ -158,9 +157,11 @@ def write_manifest(cfg: Config, split: str, files: list[dict], root: Path) -> No
         "split": split,
         "count": len(files),
         "bytes": sum(f["size"] for f in files),
+        "annotation_count": len(annotations),
         "staged_root": str(root),
         "out_dir": str(cfg.cache / f"{split}_real"),
         "files": files,
+        "annotations": annotations,
     }
     (root / "manifest.json").write_text(json.dumps(data, indent=2))
     print(f"[manifest] {root / 'manifest.json'}")
@@ -176,11 +177,20 @@ def convert(cfg: Config, split: str, root: Path) -> None:
 
 def run_split(cfg: Config, split: str, tok: str | None) -> None:
     files, root = list_mcaps(cfg, split, tok), split_root(cfg, split)
-    print(f"[{split}] {len(files)} episodes, {fmt(sum(f['size'] for f in files))}")
-    write_manifest(cfg, split, files, root)
+    # Optional per-episode subtask annotations live in a sibling annotation.mcap;
+    # fetch the ones belonging to the episodes we're keeping so the converter can
+    # emit subtasks.json. Episodes without annotations simply have none.
+    episode_dirs = {Path(f["path"]).parts[3] for f in files}
+    annotations = [
+        a for a in list_files(cfg, split, tok, "/annotation.mcap")
+        if Path(a["path"]).parts[3] in episode_dirs
+    ]
+    print(f"[{split}] {len(files)} episodes ({fmt(sum(f['size'] for f in files))}), "
+          f"{len(annotations)} with subtask annotations")
+    write_manifest(cfg, split, files, annotations, root)
     if cfg.dry_run:
         return
-    for item in files:
+    for item in files + annotations:
         download(cfg, tok, item, root)
     convert(cfg, split, root)
     if not cfg.keep_mcaps:

@@ -5,7 +5,9 @@
 """Download and unpack the public abc bottles-in-bin dataset and abc_sim assets."""
 
 import hashlib
+import http.client
 import json
+import shlex
 import shutil
 import sys
 import tarfile
@@ -16,7 +18,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import tyro
 
@@ -55,6 +57,29 @@ PRETRAINED_META_KEY = "checkpoints/abc_dit_xl_200k_model.json"
 PRETRAINED_DST = "abc_dit_xl_200k_model.pt"
 PRETRAINED_META_FORMAT = "abc_checkpoint_metadata/v1"
 
+# Released weights-only VLA parents. The default is the abc130k 200k checkpoint:
+# it shares the released DiT parent's five-task sim mixture, while vla_200k was
+# trained on the earlier xdof-only mixture and therefore has no declared abc_sim
+# task bundle. Every selected checkpoint is downloaded with its metadata sidecar
+# and stored under a unique flat cache name suitable for --pretrained-ckpt-name.
+VLA_PRETRAINED_FAMILIES = {
+    "abc130k": {
+        "key_prefix": "checkpoints/vla_abc130k_v2",
+        "dst_prefix": "vla_abc130k",
+        # The VLA sidecars predate sim_prompt_map. This is the authoritative
+        # sidecar for the identical training mixture and supplies the exact five
+        # task prompts until the VLA release metadata itself carries the map.
+        "sim_prompt_meta_key": PRETRAINED_META_KEY,
+        "training_mixture": "xdof_csf_3_5k_may20_sim0514_hours_weighted",
+    },
+    "200k": {
+        "key_prefix": "checkpoints/vla_200k_v2",
+        "dst_prefix": "vla_200k",
+        "sim_prompt_meta_key": None,
+        "training_mixture": "xdof",
+    },
+}
+
 # Simulator meshes/textures are not committed to git; they ship as tarballs listed in
 # abc_sim/models/assets_manifest.json and unpack into the (gitignored) abc_sim/models tree.
 SIM_MANIFEST = REPO_ROOT / "abc_sim" / "models" / "assets_manifest.json"
@@ -91,6 +116,9 @@ SIM_TASK_PACKAGES = {
     "chess": ("chess", "task_chess"),
     "blocks": ("blocks",),
 }
+# Policy-specific VLA releases use a distinct catalogue prefix so they cannot
+# replace the existing DiT checkpoint for the same simulator task.
+VLA_SIM_CHECKPOINT_PREFIX = "vla_"
 # Episode data for the 224x224 sim release, one tarball per dataset task_name. The task
 # names are the dataset's, not abc_sim's: 8 of the 24 carry no sim_ prefix, and the
 # spelling scene ships as seven separate tasks.
@@ -175,6 +203,25 @@ class PrepareConfig:
             "episode data unless --full or --checkpoint."
         ),
     ] = False
+    vla_pretrained: Annotated[
+        bool,
+        tyro.conf.arg(
+            help="Download a released 8.8 GB VLA parent and metadata sidecar, "
+            "sha256-verify it, and install assets for its declared sim tasks. "
+            "Defaults to abc130k at step 200000."
+        ),
+    ] = False
+    vla_pretrained_family: Annotated[
+        Literal["abc130k", "200k"],
+        tyro.conf.arg(
+            help="VLA release family selected by --vla-pretrained. abc130k is the "
+            "recommended sim-finetuning parent; 200k is the earlier xdof-only run."
+        ),
+    ] = "abc130k"
+    vla_pretrained_step: Annotated[
+        Literal[50000, 100000, 200000],
+        tyro.conf.arg(help="Published VLA step selected by --vla-pretrained."),
+    ] = 200000
     cache: Annotated[
         Path,
         tyro.conf.arg(help=f"Where to put files; defaults to ABC_CACHE or {DEFAULT_CACHE}."),
@@ -312,25 +359,30 @@ def remote_size(url):
     req = urllib.request.Request(url, method="HEAD", headers=HTTP_HEADERS)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return int(resp.headers.get("Content-Length") or 0)
+            content_length = resp.headers.get("Content-Length")
+            return int(content_length) if content_length is not None else None
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None
         raise
 
 
-def download(key, dst):
+def download(key, dst, max_attempts=5):
     """Download key to dst with a progress bar. Idempotent on full-size files."""
-    download_url(f"{DATA_BASE}/{key}", dst)
+    download_url(f"{DATA_BASE}/{key}", dst, max_attempts=max_attempts)
 
 
-def download_url(url, dst, *, expected=None, require_size=True):
-    """Download url to dst with a progress bar. Idempotent on full-size files.
+def download_url(
+    url, dst, *, expected=None, require_size=True, max_attempts=5, headers=None, label=None
+):
+    """Download URL to dst, retrying and resuming verified partial bodies.
 
     ``expected`` skips the HEAD request when the size is already known. Hosts that
     reject HEAD (the RoboCasa Box mirror) need ``require_size=False``, which streams
     with an open-ended progress line.
     """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
     if expected is None:
         try:
             expected = remote_size(url)
@@ -340,36 +392,103 @@ def download_url(url, dst, *, expected=None, require_size=True):
             expected = None
         if expected is None and require_size:
             raise RuntimeError(f"object not found: {url}")
+    label = label or dst.name
     if expected and dst.exists() and dst.stat().st_size == expected:
-        print(f"[skip] {dst.name} ({expected/1e6:.1f} MB)")
+        print(f"[skip] {label} ({expected/1e6:.1f} MB)")
         return
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_name(dst.name + ".part")
-    prefix = f"[get] {dst.name}"
-    start = time.monotonic()
+    prefix = f"[get] {label}"
+    transfer_start = time.monotonic()
+    for attempt in range(1, max_attempts + 1):
+        # With a known total, resume a valid partial body. For an open-ended
+        # response there is no reliable way to distinguish a complete .part
+        # from a truncated one, so restart it.
+        done = tmp.stat().st_size if tmp.exists() and expected is not None else 0
+        if expected is None and tmp.exists():
+            tmp.unlink()
+        elif tmp.exists() and done == expected:
+            _progress(prefix, done, expected, transfer_start, end=True)
+            tmp.replace(dst)
+            return
+        elif expected is not None and done > expected:
+            tmp.unlink()
+            done = 0
+
+        request_headers = {**HTTP_HEADERS, **(headers or {})}
+        mode = "wb"
+        if done:
+            request_headers["Range"] = f"bytes={done}-"
+            mode = "ab"
+        req = urllib.request.Request(url, headers=request_headers)
+        try:
+            resp = urllib.request.urlopen(req, timeout=300)
+            if done:
+                content_range = resp.headers.get("Content-Range", "")
+                expected_prefix = f"bytes {done}-"
+                if resp.status != 206 or not content_range.startswith(expected_prefix):
+                    # The server ignored or mishandled Range. Restart this
+                    # attempt from zero instead of appending an invalid body.
+                    resp.close()
+                    done = 0
+                    mode = "wb"
+                    resp = urllib.request.urlopen(
+                        urllib.request.Request(url, headers={**HTTP_HEADERS, **(headers or {})}),
+                        timeout=300,
+                    )
+
+            if expected is None:
+                response_size = int(resp.headers.get("Content-Length") or 0)
+                expected = response_size or None
+
+            with resp, open(tmp, mode) as out:
+                done = _stream(
+                    resp, out, done, expected, prefix, transfer_start
+                )
+        except (
+            urllib.error.URLError,
+            http.client.HTTPException,
+            TimeoutError,
+            ConnectionError,
+        ) as e:
+            if isinstance(e, urllib.error.HTTPError) and e.code == 416:
+                tmp.unlink(missing_ok=True)
+            elif isinstance(e, urllib.error.HTTPError) and e.code < 500 and e.code not in (408, 429):
+                raise  # auth/not-found are not transient
+            if attempt == max_attempts:
+                raise
+            print(f"\n[retry {attempt}/{max_attempts}] {label}: {e}; "
+                  f"resuming from {tmp.stat().st_size if tmp.exists() else 0} bytes")
+            continue
+        actual = tmp.stat().st_size
+        if expected is None or actual == expected:
+            _progress(prefix, actual, expected, transfer_start, end=True)
+            tmp.replace(dst)
+            return
+        if attempt == max_attempts:
+            raise RuntimeError(
+                f"{label}: got {actual} bytes, expected {expected} after "
+                f"{max_attempts} attempts"
+            )
+        print(f"\n[retry {attempt}/{max_attempts}] {label}: got {actual}/{expected} "
+              "bytes; resuming")
+
+
+def _stream(resp, out, done, expected, prefix, start):
+    """Copy an HTTP response body to an open file, updating the progress bar."""
     last = 0.0
-    done = 0
-    req = urllib.request.Request(url, headers=HTTP_HEADERS)
-    with urllib.request.urlopen(req, timeout=300) as resp, open(tmp, "wb") as out:
-        chunk = 1 << 20
-        while True:
-            buf = resp.read(chunk)
-            if not buf:
-                break
-            out.write(buf)
-            done += len(buf)
-            now = time.monotonic()
-            if now - last >= 0.25:
-                _progress(prefix, done, expected, start)
-                last = now
-    _progress(prefix, done, expected, start, end=True)
-    if expected is not None and done != expected:
-        tmp.unlink(missing_ok=True)
-        raise RuntimeError(
-            f"incomplete download for {dst.name}: got {_fmt_bytes(done)}, "
-            f"expected {_fmt_bytes(expected)}"
-        )
-    tmp.rename(dst)
+    chunk = 1 << 20
+    while True:
+        buf = resp.read(chunk)
+        if not buf:
+            break
+        out.write(buf)
+        done += len(buf)
+        now = time.monotonic()
+        if now - last >= 0.25:
+            _progress(prefix, done, expected, start)
+            last = now
+    return done
 
 
 def extract_tar(tar_path, cache, *, force_role=None):
@@ -502,6 +621,135 @@ def fetch_pretrained(cache, config: PrepareConfig):
         )
         print(
             f"[viz] uv run viz_policy.py --sim.checkpoint {display_dst} --sim.task TASK"
+        )
+
+
+def _load_checkpoint_metadata(key, dst):
+    """Download and validate one published checkpoint metadata sidecar."""
+    print(f"[metadata] {key}")
+    download(key, dst)
+    meta = json.loads(dst.read_text())
+    if meta.get("format") != PRETRAINED_META_FORMAT:
+        raise RuntimeError(
+            f"{dst.name}: expected format {PRETRAINED_META_FORMAT}, "
+            f"got {meta.get('format')!r}"
+        )
+    for field in ("uri", "bytes", "sha256", "step"):
+        if field not in meta:
+            raise RuntimeError(f"{dst.name}: checkpoint metadata has no {field!r} field")
+    return meta
+
+
+def _vla_sim_prompt_map(cache, release, meta):
+    """Return the exact prompt map for a VLA release's declared sim mixture.
+
+    New VLA metadata can carry the map directly. The current abc130k sidecars
+    identify the same named mixture as the DiT parent but predate its
+    sim_prompt_map field, so read that map from the DiT sidecar after first
+    checking the VLA mixture identity. The xdof-only family deliberately has no
+    fallback: it did not train on the five-task sim addition.
+    """
+    prompt_map = meta.get("sim_prompt_map")
+    if prompt_map is not None:
+        if not isinstance(prompt_map, dict):
+            raise RuntimeError("VLA checkpoint sim_prompt_map must be a JSON object")
+        return prompt_map
+
+    prompt_meta_key = release["sim_prompt_meta_key"]
+    if prompt_meta_key is None:
+        return {}
+    if meta.get("training_mixture") != release["training_mixture"]:
+        raise RuntimeError(
+            "refusing to borrow sim prompts for an unexpected VLA training mixture: "
+            f"{meta.get('training_mixture')!r}"
+        )
+
+    prompt_meta_dst = cache / Path(prompt_meta_key).name
+    prompt_meta = _load_checkpoint_metadata(prompt_meta_key, prompt_meta_dst)
+    prompt_map = prompt_meta.get("sim_prompt_map")
+    if not isinstance(prompt_map, dict) or not prompt_map:
+        raise RuntimeError(f"{prompt_meta_dst.name}: missing non-empty sim_prompt_map")
+    return prompt_map
+
+
+def fetch_vla_pretrained(cache, config: PrepareConfig):
+    """Download one released VLA parent and its matching prompt sidecar."""
+    family = config.vla_pretrained_family
+    step = config.vla_pretrained_step
+    release = VLA_PRETRAINED_FAMILIES[family]
+    key_prefix = release["key_prefix"]
+    stem = f"{release['dst_prefix']}_{step}_v2"
+    dst = cache / f"{stem}.pt"
+    meta_dst = cache / f"{stem}.json"
+    meta_key = f"{key_prefix}/{step}.json"
+
+    meta = _load_checkpoint_metadata(meta_key, meta_dst)
+    expected_uri = f"{DATA_BASE}/{key_prefix}/{step}.pt"
+    if meta["uri"] != expected_uri:
+        raise RuntimeError(
+            f"{meta_dst.name}: expected checkpoint URI {expected_uri!r}, "
+            f"got {meta['uri']!r}"
+        )
+    if int(meta["step"]) != step:
+        raise RuntimeError(
+            f"{meta_dst.name}: expected release step {step}, got {meta['step']!r}"
+        )
+
+    prompt_map = _vla_sim_prompt_map(cache, release, meta)
+    if prompt_map and "sim_prompt_map" not in meta:
+        # eval_policy.py reads the sidecar next to the locally renamed weights.
+        # Record where the inherited map came from rather than making that
+        # provenance implicit.
+        meta["sim_prompt_map"] = prompt_map
+        meta["sim_prompt_map_source"] = release["sim_prompt_meta_key"]
+        meta["name"] = dst.name
+        tmp = meta_dst.with_name(meta_dst.name + ".tmp")
+        tmp.write_text(json.dumps(meta, indent=2) + "\n")
+        tmp.replace(meta_dst)
+
+    tasks = tuple(prompt_map)
+    if tasks:
+        asset_config = PrepareConfig(
+            sim_task=tasks,
+            sim_source=config.sim_source,
+            sim_force=config.sim_force,
+        )
+        if prepare_sim(asset_config):
+            raise SystemExit(1)
+
+    print(f"[pretrained-vla] {meta['uri']} ({meta['bytes']/1e9:.1f} GB)")
+    download_url(meta["uri"], dst, expected=meta["bytes"])
+    verify_sha256(dst, meta["sha256"], dst.name)
+    print(
+        f"[pretrained-vla] sha256 ok, family {family}, release step {step}, "
+        f"licence {meta.get('license', '?')}"
+    )
+    for note in meta.get("license_notes", ()):
+        print(f"[pretrained-vla] {note}")
+
+    try:
+        display_dst = dst.relative_to(REPO_ROOT)
+    except ValueError:
+        display_dst = dst
+    print(
+        "[train] uv run train.py --policy vla "
+        f"--cache-root {shlex.quote(str(cache))} --load-pretrained "
+        f"--pretrained-ckpt-name {shlex.quote(dst.name)}"
+    )
+    if tasks:
+        print(f"[pretrained-vla] supports {len(tasks)} sim task(s) from its training mixture:")
+        for task in tasks:
+            print(f"  {task}")
+        print("[pretrained-vla] replace TASK below with one of the task names above:")
+        print(
+            f"[eval] uv run eval_policy.py --checkpoint {display_dst} --task TASK "
+            "--num-worlds 20"
+        )
+        print(f"[viz] uv run viz_policy.py --sim.checkpoint {display_dst} --sim.task TASK")
+    else:
+        print(
+            "[pretrained-vla] no abc_sim task bundle is declared for this "
+            f"{meta.get('training_mixture', family)!r} training mixture"
         )
 
 
@@ -655,6 +903,8 @@ def fetch_robocasa_packs():
 
 def resolve_sim_task(name):
     """Map a task name, alias, or prompt onto an abc_sim scene-task name."""
+    if name.startswith(VLA_SIM_CHECKPOINT_PREFIX):
+        name = name.removeprefix(VLA_SIM_CHECKPOINT_PREFIX)
     if name in SIM_TASK_PACKAGES:
         return name
     try:
@@ -856,15 +1106,18 @@ CKPT_PREFIX_BY_DATASET_TASK = {"sim_pouring_beads": "pour"}
 
 
 def resolve_sim_checkpoint_task(name, tasks):
-    """Manifest key for a --sim-checkpoint name: exact, else via the task aliases."""
+    """Manifest key for a --sim-checkpoint name: exact, else via the task aliases.
+
+    A ``vla_`` name only ever resolves to a ``vla_`` key, never to the DiT entry."""
     if name in tasks:
         return name
+    prefix = VLA_SIM_CHECKPOINT_PREFIX if name.startswith(VLA_SIM_CHECKPOINT_PREFIX) else ""
     try:
         resolved = resolve_sim_data_tasks([name], set(DATASET_TASK_SCENES))
     except SystemExit:
         return None
     for dataset_task in resolved:
-        key = CKPT_PREFIX_BY_DATASET_TASK.get(dataset_task, dataset_task)
+        key = prefix + CKPT_PREFIX_BY_DATASET_TASK.get(dataset_task, dataset_task)
         if key in tasks:
             return key
     return None
@@ -897,6 +1150,7 @@ def prepare_sim_checkpoints(config: PrepareConfig, cache):
             print(f"[sim-checkpoint] {name} -> {resolved}")
         name = resolved
         task = tasks[name]
+        sim_task = task.get("task", name.removeprefix(VLA_SIM_CHECKPOINT_PREFIX))
         step = step or str(task["recommended_step"])
         ckpt = task["checkpoints"].get(step)
         if ckpt is None:
@@ -930,10 +1184,10 @@ def prepare_sim_checkpoints(config: PrepareConfig, cache):
             continue
         if task.get("prompt"):
             print(
-                f"[eval] uv run eval_policy.py --checkpoint {dst} --task {name} "
+                f"[eval] uv run eval_policy.py --checkpoint {dst} --task {sim_task} "
                 f"--prompt '{task['prompt']}' --num-worlds 20"
             )
-        print(f"[viz] uv run viz_policy.py --sim.task {name}")
+        print(f"[viz] uv run viz_policy.py --sim.checkpoint {dst} --sim.task {sim_task}")
     return failed
 
 
@@ -1093,6 +1347,7 @@ def prepare_sim(config: PrepareConfig):
 def main(config: PrepareConfig):
     # Keep status lines interleaved with the stderr progress bars when output is a pipe.
     sys.stdout.reconfigure(line_buffering=True)
+    pretrained_requested = config.pretrained or config.vla_pretrained
     assets_requested = bool(
         config.sim
         or config.sim_task
@@ -1109,7 +1364,7 @@ def main(config: PrepareConfig):
         or config.sim_bundle_list
     )
     sim_requested = assets_requested or data_requested or ckpt_requested
-    if not (sim_requested or config.pretrained) and (
+    if not (sim_requested or pretrained_requested) and (
         config.sim_source is not None or config.sim_force
     ):
         raise SystemExit(
@@ -1129,7 +1384,7 @@ def main(config: PrepareConfig):
             sim_failures += prepare_sim_checkpoints(config, cache)
         # Sim asset flags on their own do not imply the bottles dataset; ask for that
         # explicitly. --sim-data is itself a dataset download, so it exits here too.
-        if not (config.full or config.checkpoint or config.pretrained):
+        if not (config.full or config.checkpoint or pretrained_requested):
             raise SystemExit(1 if sim_failures else 0)
 
     cache.mkdir(parents=True, exist_ok=True)
@@ -1139,7 +1394,7 @@ def main(config: PrepareConfig):
     for key, name in SMALL_FILES:
         download(key, cache / name)
 
-    if config.full or config.checkpoint or not config.pretrained:
+    if config.full or config.checkpoint or not pretrained_requested:
         tars = FULL_TARS if config.full else [PREVIEW_TAR]
         fetch_tars(cache, tars, skip_extract=config.skip_extract)
 
@@ -1149,6 +1404,9 @@ def main(config: PrepareConfig):
 
     if config.pretrained:
         fetch_pretrained(cache, config)
+
+    if config.vla_pretrained:
+        fetch_vla_pretrained(cache, config)
 
     print("\n[done] cache layout:")
     for entry in sorted(cache.iterdir()):

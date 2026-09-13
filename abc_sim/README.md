@@ -310,7 +310,7 @@ default.
 ### The multi-task sim policy
 
 `abc_dit_xl_200k_model.pt` is the DiT-XL parent behind `--load-pretrained`
-finetuning (see the [top-level README](../README.md#training-an-abc-dit)), trained on the
+finetuning (see the [top-level README](../README.md#abc-dit-training)), trained on the
 3.5k-hour real mixture plus 98 hours of sim across five tasks. It is also the
 checkpoint to evaluate those five tasks with:
 

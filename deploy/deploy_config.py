@@ -1,9 +1,15 @@
-"""User-facing ABC-DiT deployment configuration."""
+"""User-facing deployment configuration for the DiT and VLA policies."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Literal
 
-from deploy.policy import PolicyConfig
+from abc_minimal.config import ClipConfig, DiTConfig, VLAModelConfig
+from abc_minimal.policy import InferenceConfig
 from deploy.robot.gym.policy_rollout_config import PolicyRolloutConfig
+from deploy.serve_policy_config import Args as ServeArgs
+
+DEFAULT_PROMPT = "throw plastic bottles in bin"
+MODEL_SIZES = {"dit": "dit_xL", "vla": "vla_4b"}
 
 
 @dataclass
@@ -26,6 +32,14 @@ class DeployConfig:
     remote_host: str = ""
     port: int = 8000
 
+    policy_type: Literal["auto", "dit", "vla"] = "auto"
+    """"auto" classifies the checkpoint (DiT vs VLA); override to force one."""
+    model_size: str = ""
+    """Model name stamped into recordings and review videos; empty follows policy_type."""
+    dit_model: DiTConfig = field(default_factory=DiTConfig)
+    clip: ClipConfig = field(default_factory=ClipConfig)
+    vla_model: VLAModelConfig = field(default_factory=VLAModelConfig)
+
     record: bool = True
     """Record the robot rollout to H5 (disable with --no-record)."""
     collection_name: str = "policy_rollout"
@@ -36,24 +50,29 @@ class DeployConfig:
     episode_control: bool = True
     """Keyboard episode control for --no-record runs (a/b start or stop+home,
     c/j shut down). Recording runs always have episode control via the recorder."""
-    foot_pedal_device: str | None = None
-    """Pedal evdev path. Default: FOOT_PEDAL_INPUT_DEVICE or the PCsensor
-    device when plugged in; pass '' for keyboard-only."""
     verbose: bool = False
 
-    def checkpoint(self) -> PolicyConfig:
-        return PolicyConfig(
-            checkpoint_path=self.checkpoint_path,
-            norm_stats_path=self.norm_stats_path,
-            prompt=self.prompt or "throw plastic bottles in bin",
-            diffusion_steps=self.diffusion_steps,
-            deterministic=self.deterministic,
-            fast_inference=self.fast_inference,
-            rtc_prefix_length=self.rtc_prefix_length if self.rtc else None,
+    def serve_args(self) -> ServeArgs:
+        """Build the policy server's config, both architectures included."""
+        return ServeArgs(
+            policy=InferenceConfig(
+                checkpoint_path=self.checkpoint_path,
+                norm_stats_path=self.norm_stats_path,
+                prompt=self.prompt or DEFAULT_PROMPT,
+                diffusion_steps=self.diffusion_steps,
+                deterministic=self.deterministic,
+                fast_inference=self.fast_inference,
+                rtc_prefix_length=self.rtc_prefix_length if self.rtc else None,
+            ),
+            policy_type=self.policy_type,
+            dit_model=self.dit_model,
+            clip=self.clip,
+            vla_model=self.vla_model,
+            port=self.port,
         )
 
     def rollout_config(
-        self, *, pedal_control: bool = False, direct_episode_keys: bool = False
+        self, *, recorder_control: bool = False, direct_episode_keys: bool = False
     ) -> PolicyRolloutConfig:
         return PolicyRolloutConfig(
             prompt=self.prompt,
@@ -66,5 +85,5 @@ class DeployConfig:
             prefix_length=self.rtc_prefix_length,
             inference_lead_steps=self.rtc_inference_lead_steps,
             compress_images=self.compress_images,
-            pedal_control=pedal_control,
+            recorder_control=recorder_control,
         )

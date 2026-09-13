@@ -104,9 +104,9 @@ class InferenceRecorderNode(RecorderBase):
             key_pressed = self._key_press(message)
             if key_pressed is not None:
                 if key_pressed in ["a", "b", "x"]:
-                    self._handle_start_stop_pedal()
+                    self._handle_start_stop_key()
                 elif key_pressed in ["c", "j"]:
-                    self._handle_right_pedal()
+                    self._handle_shutdown_key()
 
         self._poll_sensor_topics()
         if self._pending_dagger_start and self._cameras_ready_or_defer():
@@ -121,7 +121,7 @@ class InferenceRecorderNode(RecorderBase):
             if extras.get("event") == "ready":
                 if not self._inference_ready:
                     self._inference_ready = True
-                    print("Inference server ready — pedal input now accepted.")
+                    print("Inference server ready — key input now accepted.")
             elif (
                 self._waiting_for_inference
                 and not self.record_data
@@ -304,14 +304,14 @@ class InferenceRecorderNode(RecorderBase):
         """Publish a control command to the inference server."""
         self.publish(self.control_topic, np.array([0]), extras={"command": command})
 
-    def _handle_start_stop_pedal(self) -> None:
-        """Left/middle pedal: toggle inference on/off.
+    def _handle_start_stop_key(self) -> None:
+        """Keys a/b/x: toggle inference on/off.
 
         Not running → start inference (recording auto-starts on first event).
         Running → stop recording + go home (ready for next episode).
         """
         if not self._inference_ready:
-            print("Inference server not ready yet — ignoring pedal.")
+            print("Inference server not ready yet — ignoring key.")
             return
         if self.record_data:
             # Currently running → stop + go home
@@ -319,7 +319,7 @@ class InferenceRecorderNode(RecorderBase):
             self._send_inference_command("stop_and_reset")
             self._waiting_for_inference = True
             print(
-                "Sent stop_and_reset — robot will go home. Press pedal to start next episode."
+                "Sent stop_and_reset — robot will go home. Press a/b to start next episode."
             )
         else:
             # Not running → start inference
@@ -329,8 +329,8 @@ class InferenceRecorderNode(RecorderBase):
                 "Sent start — inference will begin. Recording starts on first inference event."
             )
 
-    def _handle_right_pedal(self) -> None:
-        """Right pedal: stop recording + full shutdown of all processes."""
+    def _handle_shutdown_key(self) -> None:
+        """Keys c/j: stop recording + full shutdown of all processes."""
         if self.record_data:
             self._stop_recording()
         self._send_inference_command("shutdown")

@@ -8,9 +8,42 @@ step ``step`` or ``training_step``; readers tolerate both.
 
 import os
 import shutil
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
+
+
+def model_state_dict(ckpt) -> dict[str, torch.Tensor]:
+    """Return model weights from current, released-VLA, or bare checkpoints.
+
+    ``model`` is the canonical key used by local/DiT checkpoints.  The first
+    released VLA checkpoints used ``model_state_dict``; keep reading that
+    layout so existing public objects remain usable.  Compile prefixes are an
+    implementation detail and are stripped at the checkpoint boundary.
+    """
+    if not isinstance(ckpt, Mapping):
+        raise TypeError(f"checkpoint must be a mapping, got {type(ckpt).__name__}")
+
+    state = None
+    for key in ("model", "model_state_dict", "state_dict"):
+        candidate = ckpt.get(key)
+        if isinstance(candidate, Mapping):
+            state = candidate
+            break
+    if state is None:
+        # A bare state_dict is still a supported model-only checkpoint.
+        state = ckpt
+
+    if not state or not all(isinstance(key, str) for key in state):
+        raise ValueError("checkpoint does not contain a valid model state_dict")
+    non_tensors = [key for key, value in state.items() if not torch.is_tensor(value)]
+    if non_tensors:
+        raise ValueError(
+            "checkpoint does not contain a model state_dict "
+            f"(non-tensor entries: {non_tensors[:5]})"
+        )
+    return {key.removeprefix("_orig_mod."): value for key, value in state.items()}
 
 
 def checkpoint_step(ckpt) -> int:
@@ -39,10 +72,33 @@ def check_topology(ckpt, *, batch_size, data_world, rank) -> None:
                   f"position will not correspond")
 
 
-def restore_training_state(ckpt, *, optimizer, scheduler, resume_step, rank, source=None) -> None:
-    """Restore optimizer/scheduler state, tolerating legacy model-only files."""
+def fsdp_state_dicts(model, optimizer):
+    """Full, unsharded model and optimizer state on CPU. A collective: every rank calls it."""
+    from torch.distributed.checkpoint.state_dict import (
+        StateDictOptions, get_model_state_dict, get_optimizer_state_dict,
+    )
+
+    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    return (get_model_state_dict(model, options=options),
+            get_optimizer_state_dict(model, optimizer, options=options))
+
+
+def restore_training_state(ckpt, *, optimizer, scheduler, resume_step, rank, source=None,
+                           fsdp_model=None) -> None:
+    """Restore optimizer/scheduler state, tolerating legacy model-only files.
+
+    ``fsdp_model`` is the sharded model when resuming under FSDP: its optimizer
+    state is keyed by parameter name, so DDP and FSDP checkpoints do not
+    interchange their optimizer state (the weights load either way)."""
     source = source or "resume checkpoint"
-    if "optimizer" in ckpt:
+    if "optimizer" in ckpt and fsdp_model is not None:
+        from torch.distributed.checkpoint.state_dict import StateDictOptions, set_optimizer_state_dict
+
+        if any(isinstance(key, int) for key in ckpt["optimizer"].get("state", {})):
+            raise ValueError(f"{source} holds DDP optimizer state; resume it without --fsdp")
+        set_optimizer_state_dict(fsdp_model, optimizer, optim_state_dict=ckpt["optimizer"],
+                                 options=StateDictOptions(full_state_dict=True))
+    elif "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])
     elif rank == 0:
         print(f"WARNING: {source} has no optimizer state "
@@ -60,12 +116,14 @@ def restore_training_state(ckpt, *, optimizer, scheduler, resume_step, rank, sou
 
 
 def save_checkpoint(path, *, module, optimizer, scheduler, global_step, norm_stats,
-                    batch_size=None, data_world=None, train_config=None) -> None:
+                    batch_size=None, data_world=None, model_config=None,
+                    train_config=None, model_state=None, optimizer_state=None) -> None:
     """Write the checkpoint via tmp file + rename so a crash mid-write can
-    never leave a truncated file where resume looks."""
+    never leave a truncated file where resume looks. ``model_state`` and
+    ``optimizer_state`` carry the gathered dicts of an FSDP run."""
     payload = {
-        "model": module.state_dict(),
-        "optimizer": optimizer.state_dict(),
+        "model": module.state_dict() if model_state is None else model_state,
+        "optimizer": optimizer.state_dict() if optimizer_state is None else optimizer_state,
         "scheduler": scheduler.state_dict(),
         "global_step": global_step,
         "norm_stats": norm_stats,
@@ -74,6 +132,8 @@ def save_checkpoint(path, *, module, optimizer, scheduler, global_step, norm_sta
         payload["batch_size"] = int(batch_size)
     if data_world is not None:
         payload["data_world"] = int(data_world)
+    if model_config is not None:
+        payload["model_config"] = model_config
     if train_config is not None:
         # Plain dict so eval-side readers (resolve_trained_max_prefix) need
         # no import of this repo's dataclasses to interpret it.

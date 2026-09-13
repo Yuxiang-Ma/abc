@@ -36,9 +36,8 @@ def _gello_spec(cfg: DaggerConfig, profile, side: str) -> ProcessSpec:
 
 def _build_specs(cfg: DaggerConfig) -> list[ProcessSpec]:
     task_name, session_tag = _prepare_task(cfg)
-    checkpoint = cfg.checkpoint()
     profile = get_i2rt_config()
-    specs = _server_specs(cfg, checkpoint)
+    specs = _server_specs(cfg)
     if not cfg.debug:
         specs.extend(follower_specs(profile, quiet=not cfg.verbose))
     specs.extend(camera_specs(profile))

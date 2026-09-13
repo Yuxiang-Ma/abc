@@ -82,9 +82,9 @@ def _publish_inference_event(
 
 
 class InferenceController:
-    """Subscribes to ``inference_control`` ZMQ topic and provides pedal commands."""
+    """Subscribes to ``inference_control`` ZMQ topic and provides operator commands."""
 
-    idle_prompt = "IDLE — press the pedal to start inference."
+    idle_prompt = "IDLE — press a/b to start inference (c/j to shut down)."
 
     def __init__(self):
         self._zmq_context = zmq.Context()
@@ -107,7 +107,7 @@ class InferenceController:
 
 class KeyboardEpisodeController:
     """Consumes KeyListener key presses directly (episode control without a
-    recorder). Same key mapping as the recorder's pedal handling: a/b/x
+    recorder). Same key mapping as the recorder's key handling: a/b/x
     toggles start <-> stop-and-home, c/j shuts everything down. Returns
     "toggle" so the rollout can interpret it by phase (IDLE -> start,
     mid-episode -> stop_and_reset)."""
@@ -142,11 +142,11 @@ class KeyboardEpisodeController:
         self._sub.close()
 
 
-def _wait_for_pedal_start(controller, inference_pub) -> str:
+def _wait_for_start_key(controller, inference_pub) -> str:
     """Block in IDLE until the controller sends 'start' or 'shutdown'.
 
     Publishes a ``ready`` heartbeat each tick so the recorder can confirm the
-    rollout is alive before forwarding pedal commands (ZMQ pub/sub drops early
+    rollout is alive before forwarding operator commands (ZMQ pub/sub drops early
     messages, so the recorder waits for the first heartbeat).
     """
     while True:
@@ -214,12 +214,11 @@ def run_policy_rollout(
     execute_chunk_dim: int,
     host: str = "0.0.0.0",
     port: int = 8000,
-    pedal_control: bool = False,
+    recorder_control: bool = False,
     direct_episode_keys: bool = False,
     compress_images: bool = False,
     rtc: bool = False,
     prefix_length: int = 5,
-    inference_lead_steps: int = 10,
 ) -> None:
     """Connect to the policy server and run standard or RTC episodes."""
     if rtc:
@@ -245,17 +244,13 @@ def run_policy_rollout(
 
     context = zmq.Context()
     inference_pub = comms.create_publisher(context, "inference_events")
-    if pedal_control:
+    if recorder_control:
         controller = InferenceController()
     elif direct_episode_keys:
         controller = KeyboardEpisodeController(context)
     else:
         controller = None
-    rtc_manager = (
-        RTCInferenceManager(policy, prefix_length, inference_lead_steps)
-        if rtc
-        else None
-    )
+    rtc_manager = RTCInferenceManager(policy, prefix_length) if rtc else None
 
     try:
         obs, _ = env.reset()
@@ -263,7 +258,7 @@ def run_policy_rollout(
         while True:
             if controller is not None:
                 print(controller.idle_prompt)
-                if _wait_for_pedal_start(controller, inference_pub) == "shutdown":
+                if _wait_for_start_key(controller, inference_pub) == "shutdown":
                     return
 
             if rtc:
@@ -322,7 +317,6 @@ def _run_rtc_episode(
     action_prefix = _first_rtc_action_prefix(obs, env, prefix_length)
     obs["action_prefix"] = action_prefix
     obs["prefix_length"] = prefix_length
-    obs["latency"] = env.inference_lead_steps - prefix_length
 
     print("Starting first chunk (blocking inference, conditioned on reset state)...")
     t_start = time.perf_counter()
@@ -365,7 +359,7 @@ def _run_rtc_episode(
                 "the robot may pause between chunks."
             )
 
-        # Check for pedal commands between chunks
+        # Check for operator commands between chunks
         if controller is not None:
             cmd = controller.poll_command()
             if cmd in ("stop_and_reset", "toggle"):
@@ -418,7 +412,7 @@ def _select_rollout(args: PolicyRolloutConfig, config):
         "host": args.host,
         "port": args.port,
         "compress_images": args.compress_images,
-        "pedal_control": args.pedal_control,
+        "recorder_control": args.recorder_control,
         "direct_episode_keys": args.direct_episode_keys,
     }
     if args.rtc:
@@ -436,7 +430,6 @@ def _select_rollout(args: PolicyRolloutConfig, config):
             **common,
             "rtc": True,
             "prefix_length": args.prefix_length,
-            "inference_lead_steps": args.inference_lead_steps,
         }
 
     env = ChunkedYAMEnv(

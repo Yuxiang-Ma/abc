@@ -1,4 +1,4 @@
-"""Live Viser viewer over an ABC-DiT sim rollout."""
+"""Live Viser viewer over an ABC DiT or VLA sim rollout."""
 
 import tyro
 

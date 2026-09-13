@@ -8,7 +8,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-
 # Image normalization stats, keyed by preset: DINOv3 uses ImageNet stats,
 # CLIP its own. (mean, std) as (3, 1, 1) tensors.
 NORM_PRESETS = {
@@ -56,8 +55,8 @@ def resize_with_pad(img_hwc, target_h=224, target_w=224):
     if (h, w) == (target_h, target_w):
         return img_hwc
     ratio = max(w / target_w, h / target_h)
-    new_h = max(1, int(round(h / ratio)))
-    new_w = max(1, int(round(w / ratio)))
+    new_h = max(1, round(h / ratio))
+    new_w = max(1, round(w / ratio))
     resized = F.interpolate(
         img_hwc.permute(2, 0, 1).unsqueeze(0),
         size=(new_h, new_w),
@@ -81,19 +80,36 @@ def normalize_image(img_chw, preset="imagenet"):
     return (img_chw - mean) / (std + 1e-6)
 
 
-def resize_pad_normalize(img_chw, target_h=224, target_w=224, preset="imagenet"):
+def resize_pad_raw(img_chw, target_h=224, target_w=224):
+    """Aspect-preserving resize/pad of a CHW image into raw [0, 1].
+
+    Where the VLA image path stops: SigLIP owns mean/std. DiT continues
+    through resize_pad_normalize.
+    """
     x = torch.as_tensor(img_chw).float()
     if x.max() > 1.0:
         x = x / 255.0
-    x = resize_with_pad(x.permute(1, 2, 0), target_h, target_w).permute(2, 0, 1)
+    return resize_with_pad(x.permute(1, 2, 0), target_h, target_w).permute(2, 0, 1)
+
+
+def resize_pad_normalize(img_chw, target_h=224, target_w=224, preset="imagenet"):
+    x = resize_pad_raw(img_chw, target_h, target_w)
     return normalize_image(x, preset=preset)
 
 
 def resize_pad_normalize_batch(img_bchw, target_h=224, target_w=224, preset="imagenet"):
-    """resize_pad_normalize over a (B, 3, H, W) uint8 batch, on the batch's own device."""
+    """Resize/pad (B, 3, H, W) uint8 [0,255] or floating [0,1] images.
+
+    ``preset=None`` stops at raw [0, 1], like ``resize_pad_raw``.
+    """
     x = torch.as_tensor(img_bchw)
-    if not torch.is_floating_point(x):
+    if x.dtype == torch.uint8:
         x = x.float() / 255.0
+    elif torch.is_floating_point(x):
+        if not ((x >= 0) & (x <= 1)).all():
+            raise ValueError("Float images must be finite and in [0, 1]")
+    else:
+        raise TypeError("Images must be uint8 or floating point")
     _, _, h, w = x.shape
     if (h, w) != (target_h, target_w):
         ratio = max(w / target_w, h / target_h)
@@ -105,14 +121,14 @@ def resize_pad_normalize_batch(img_bchw, target_h=224, target_w=224, preset="ima
         pad_h0 = (target_h - new_h) // 2
         pad_w0 = (target_w - new_w) // 2
         x = F.pad(x, (pad_w0, target_w - new_w - pad_w0, pad_h0, target_h - new_h - pad_h0), value=0)
-    return normalize_image(x, preset=preset)
+    return x if preset is None else normalize_image(x, preset=preset)
 
 
 def _rotate(img_hwc, angle_deg):
     """Rotate (H,W,C) with reflection padding."""
     if abs(angle_deg) < 0.1:
         return img_hwc
-    H, W, C = img_hwc.shape
+    H, W, _ = img_hwc.shape
     a = math.radians(angle_deg)
     cos_a, sin_a = math.cos(a), math.sin(a)
     gy, gx = torch.meshgrid(
@@ -129,8 +145,12 @@ def _rotate(img_hwc, angle_deg):
     return out.squeeze(0).permute(1, 2, 0)
 
 
-def augment_and_normalize(images, train, norm_preset="imagenet"):
-    """Apply production image augmentations and backbone-specific normalization."""
+def augment_and_normalize(images, train, norm_preset="imagenet", image_size=224):
+    """Apply augmentations, optionally followed by backbone normalization.
+
+    ``norm_preset=None`` is the VLA path: Gemma/SigLIP owns normalization and
+    therefore receives resized images in raw [0, 1] space.
+    """
     out = {}
     for cam, img in images.items():
         x = img.permute(1, 2, 0)
@@ -149,7 +169,7 @@ def augment_and_normalize(images, train, norm_preset="imagenet"):
                     mode="bilinear",
                     align_corners=False,
                 ).squeeze(0).permute(1, 2, 0)
-        x = resize_with_pad(x, 224, 224)
+        x = resize_with_pad(x, image_size, image_size)
         if train:
             b = 0.7 + torch.rand(1).item() * 0.6
             x = x * b
@@ -160,5 +180,6 @@ def augment_and_normalize(images, train, norm_preset="imagenet"):
             gray = x.mean(dim=-1, keepdim=True)
             x = gray + (x - gray) * s
             x = torch.clamp(x, 0, 1)
-        out[cam] = normalize_image(x.permute(2, 0, 1), preset=norm_preset)
+        x = x.permute(2, 0, 1)
+        out[cam] = x if norm_preset is None else normalize_image(x, preset=norm_preset)
     return out

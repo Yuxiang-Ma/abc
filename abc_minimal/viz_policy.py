@@ -1,4 +1,4 @@
-"""Live Viser viewer for an ABC-DiT sim rollout.
+"""Live Viser viewer for an ABC DiT or VLA sim rollout.
 
 Visualise a policy on any task from the vendored abc_sim catalogue
 (``--sim.task``); every task streams through ``run_sim_task_viewer``.
@@ -26,10 +26,10 @@ from abc_minimal.config import (
     VizSimEvalConfig,
     default_cache_root,
     validate_model_config,
+    validate_vla_model_config,
 )
 from abc_minimal.eval_policy import (
     RTCManager,
-    SimPolicy,
     checkpoint_sim_prompt,
     progress_text,
     require_mjwarp,
@@ -37,6 +37,11 @@ from abc_minimal.eval_policy import (
     resolve_prefix_length,
     validate_rtc_config,
 )
+from abc_minimal.policy import (
+    DiTInferencePolicy,
+    VLAInferencePolicy,
+)
+from deploy.policy.selector import sniff_policy_kind
 
 # An unedited --sim.prompt default means "resolve from the task"; reading it
 # off the class keeps this true even if the default is ever re-pinned.
@@ -148,7 +153,7 @@ def run_sim_task_viewer(cfg: VizPolicyConfig) -> None:
     """
     torch.set_float32_matmul_precision("high")
 
-    # SimPolicy embeds config.prompt into a CLIP vector once, in __init__, so the
+    # The DiT policy embeds config.prompt into a CLIP vector in __init__, so the
     # checkpoint and prompt have to be resolved before the policy (and env) are built.
     release_prompt = None
     if cfg.sim.checkpoint:
@@ -169,8 +174,17 @@ def run_sim_task_viewer(cfg: VizPolicyConfig) -> None:
         checkpoint_config,
         prompt=resolve_viz_prompt(cfg.sim.task, cfg.sim.prompt, trained_prompt),
     )
+    policy_kind = (
+        sniff_policy_kind(str(checkpoint)) if sim.policy == "auto" else sim.policy
+    )
+    model_config = sim.vla_model if policy_kind == "vla" else sim.model
     device = resolve_device(sim.device)
-    errors = validate_model_config(sim.model) + validate_rtc_config(sim)
+    model_errors = (
+        validate_vla_model_config(sim.vla_model)
+        if policy_kind == "vla"
+        else validate_model_config(sim.model)
+    )
+    errors = model_errors + validate_rtc_config(sim)
     if cfg.fast_inference and not device.startswith("cuda"):
         errors.append(
             f"--fast-inference needs a CUDA device, resolved device is {device!r}; "
@@ -184,13 +198,14 @@ def run_sim_task_viewer(cfg: VizPolicyConfig) -> None:
 
     from abc_minimal.sim_env import SimTaskEnv
 
-    policy = SimPolicy(checkpoint, sim, device)
-    resolve_prefix_length(sim, policy.trained_max_prefix)
+    policy_cls = VLAInferencePolicy if policy_kind == "vla" else DiTInferencePolicy
+    policy = policy_cls(checkpoint, sim, device, model_config=model_config)
+    resolve_prefix_length(sim, policy.trained_max_prefix, model_config)
     env = SimTaskEnv(
         task=sim.task,
         height=sim.camera_height,
         width=sim.camera_width,
-        camera_keys=sim.model.camera_keys,
+        camera_keys=model_config.camera_keys,
         prompt=sim.prompt,
         camera_backend=sim.camera_backend,
         gpu_id=sim.gpu_id,
@@ -204,7 +219,7 @@ def run_sim_task_viewer(cfg: VizPolicyConfig) -> None:
         float(gym_env.model.opt.timestep),
         getattr(gym_env, "_control_decimation", None),
     )
-    action_shape = (sim.model.chunk_length, sim.model.action_dim)
+    action_shape = (model_config.chunk_length, model_config.action_dim)
     print(
         f"task={sim.task} prompt={sim.prompt!r} control={1.0 / step_period_s:.0f}Hz",
         flush=True,

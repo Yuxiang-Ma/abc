@@ -19,9 +19,15 @@ import torch
 from abc_minimal.config import (
     SimEvalConfig,
     validate_model_config,
+    validate_vla_model_config,
 )
-from abc_sim.randomization.core import RandomizationSamplingError
+from abc_minimal.policy import (
+    DiTInferencePolicy,
+    VLAInferencePolicy,
+)
 from abc_minimal.policy import DiTInferencePolicy as SimPolicy
+from abc_sim.randomization.core import RandomizationSamplingError
+from deploy.policy.selector import sniff_policy_kind
 
 if TYPE_CHECKING:
     from abc_minimal.sim_env import SimTaskEnv
@@ -48,7 +54,7 @@ def require_mjwarp() -> None:
 class RTCManager:
     def __init__(
         self,
-        policy: "SimPolicy",
+        policy: SimPolicy,
         *,
         prefix_length: int,
         inference_lead_steps: int,
@@ -62,9 +68,11 @@ class RTCManager:
         self._pending: concurrent.futures.Future[tuple[np.ndarray, float]] | None = None
 
     def _action_prefix(self, actions: np.ndarray) -> np.ndarray:
-        m = self.policy.config.model
         executed = np.asarray(actions[..., : self.execute_chunk_dim, :], dtype=np.float32)
-        prefix = np.zeros((*executed.shape[:-2], m.chunk_length, m.action_dim), dtype=np.float32)
+        prefix = np.zeros(
+            (*executed.shape[:-2], self.policy.chunk_length, self.policy.action_dim),
+            dtype=np.float32,
+        )
         prefix[..., : self.prefix_length, :] = executed[..., -self.prefix_length :, :]
         return prefix
 
@@ -148,7 +156,9 @@ def without_missing_counts(metric: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def resolve_prefix_length(config: SimEvalConfig, trained_max_prefix: int) -> int:
+def resolve_prefix_length(
+    config: SimEvalConfig, trained_max_prefix: int, model_config: Any
+) -> int:
     """Effective synchronous prefix length for the sequential loop (0 = off).
 
     Needs the checkpoint's trained max, so this runs after loading rather than
@@ -169,6 +179,14 @@ def resolve_prefix_length(config: SimEvalConfig, trained_max_prefix: int) -> int
                 f"{trained_max_prefix}, exclusive bound)"
             )
             config.rtc_prefix_length = capped
+        # Each RTC re-inference yields chunk_length - rtc_prefix_length actions
+        # (RTCManager._run strips the prefix); the loops execute execute_chunk_dim of them.
+        if config.rtc_prefix_length + config.execute_chunk_dim > model_config.chunk_length:
+            raise ValueError(
+                f"rtc_prefix_length + execute_chunk_dim "
+                f"({config.rtc_prefix_length} + {config.execute_chunk_dim}) "
+                f"must be <= chunk_length ({model_config.chunk_length})"
+            )
         return 0
     length = config.prefix_length
     if length is None:
@@ -194,10 +212,10 @@ def resolve_prefix_length(config: SimEvalConfig, trained_max_prefix: int) -> int
             f"prefix_length ({length}) must be <= execute_chunk_dim "
             f"({config.execute_chunk_dim}) so executed actions can seed the next prefix"
         )
-    if length + config.execute_chunk_dim > config.model.chunk_length:
+    if length + config.execute_chunk_dim > model_config.chunk_length:
         errors.append(
             f"prefix_length + execute_chunk_dim ({length} + {config.execute_chunk_dim}) "
-            f"must be <= chunk_length ({config.model.chunk_length})"
+            f"must be <= chunk_length ({model_config.chunk_length})"
         )
     if errors:
         raise ValueError("Invalid prefix config:\n  - " + "\n  - ".join(errors))
@@ -353,7 +371,7 @@ def resolve_output_dir(config: SimEvalConfig) -> str:
     return str(ROOT / "outputs" / f"sim_eval_{config.task}")
 
 
-def _make_env(config: SimEvalConfig) -> "SimTaskEnv":
+def _make_env(config: SimEvalConfig, camera_keys: tuple[str, ...]) -> SimTaskEnv:
     """Build the rollout env for the configured task (abc_sim catalogue)."""
     from abc_minimal.sim_env import SimTaskEnv
 
@@ -361,7 +379,7 @@ def _make_env(config: SimEvalConfig) -> "SimTaskEnv":
         task=config.task,
         height=config.camera_height,
         width=config.camera_width,
-        camera_keys=config.model.camera_keys,
+        camera_keys=camera_keys,
         prompt=config.prompt,
         camera_backend=config.camera_backend,
         gpu_id=config.gpu_id,
@@ -463,7 +481,18 @@ def build_summary(
 
 
 def run_eval(config: SimEvalConfig) -> dict[str, Any]:
-    model_errors = validate_model_config(config.model)
+    ckpt_path = Path(config.checkpoint).expanduser().resolve()
+    policy_kind = (
+        sniff_policy_kind(str(ckpt_path))
+        if config.policy == "auto"
+        else config.policy
+    )
+    model_config = config.vla_model if policy_kind == "vla" else config.model
+    model_errors = (
+        validate_vla_model_config(config.vla_model)
+        if policy_kind == "vla"
+        else validate_model_config(config.model)
+    )
     config_errors = (
         model_errors + validate_rtc_config(config) + validate_batched_config(config)
     )
@@ -474,13 +503,16 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
     options = reset_options(config)
     config = replace(
         config,
+        policy=policy_kind,
         prompt=resolve_prompt(config),
         output_dir=resolve_output_dir(config),
     )
-    ckpt_path = Path(config.checkpoint).expanduser().resolve()
     device = resolve_device(config.device, config.gpu_id)
-    policy = SimPolicy(ckpt_path, config, device)
-    prefix_length = resolve_prefix_length(config, policy.trained_max_prefix)
+    policy_cls = VLAInferencePolicy if policy_kind == "vla" else DiTInferencePolicy
+    policy = policy_cls(ckpt_path, config, device, model_config=model_config)
+    prefix_length = resolve_prefix_length(
+        config, policy.trained_max_prefix, model_config
+    )
     config = replace(config, prefix_length=prefix_length)
     prefix_text = (
         f"conditioning on the last {prefix_length} executed actions"
@@ -500,7 +532,7 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
         env = make_batched_env(config)
         rollout = rollout_batched_worlds
     else:
-        env = _make_env(config)
+        env = _make_env(config, tuple(model_config.camera_keys))
         rollout = rollout_worlds
     physics = resolved_physics(env)
     if physics is not None:
@@ -510,7 +542,7 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
             f"control={physics['control_hz']:.2f}Hz",
             flush=True,
         )
-    worlds = rollout(config, policy, env, prefix_length, options, out_dir)
+    worlds = rollout(config, policy, env, prefix_length, options, out_dir, model_config)
     return build_summary(
         config=config,
         ckpt_path=ckpt_path,
@@ -528,13 +560,14 @@ def rollout_worlds(
     prefix_length: int,
     options: dict[str, Any] | None,
     out_dir: Path,
+    model_config: Any,
 ) -> list[dict[str, Any]]:
     """Roll out the worlds one at a time in CPU MuJoCo; returns their records."""
     rng = np.random.default_rng(config.policy_seed)
     worlds = []
     fast_inference_ready = False
     rtc_warmup_ready = False
-    action_shape = (config.model.chunk_length, config.model.action_dim)
+    action_shape = (model_config.chunk_length, model_config.action_dim)
 
     def sample_noise(generator: np.random.Generator) -> np.ndarray:
         return generator.standard_normal(action_shape, dtype=np.float32)
@@ -592,7 +625,7 @@ def rollout_worlds(
 
                 video_path = out_dir / f"world_{world_index:03d}.mp4"
                 video = imageio.get_writer(str(video_path), fps=config.video_fps, macro_block_size=1)
-                video.append_data(video_frame(obs["images"], config.model.camera_keys))
+                video.append_data(video_frame(obs["images"], model_config.camera_keys))
             final_eval = env.evaluate_vanilla() if config.vanilla_physics else env.evaluate()
             # Best instantaneous progress fraction over the episode; the
             # production dishrack eval aggregated this, not the final state.
@@ -674,7 +707,7 @@ def rollout_worlds(
                         max_reward = max(max_reward, float(final_eval.get("reward", 0.0)))
                         steps += 1
                         if video is not None and steps % config.video_every_n_actions == 0:
-                            video.append_data(video_frame(render_fn(), config.model.camera_keys))
+                            video.append_data(video_frame(render_fn(), model_config.camera_keys))
                         if rollout_over(final_eval):
                             break
                     steps_s = time.perf_counter() - t_steps

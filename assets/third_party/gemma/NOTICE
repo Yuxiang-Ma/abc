@@ -1,0 +1,16 @@
+Gemma 3 and SigLIP components
+=============================
+
+The Gemma 3 language model and SigLIP vision components adapted under
+`abc_minimal/gemma/` (including the SentencePiece tokenizer model
+`abc_minimal/gemma/tokenizer/gemma3_cleaned_262144_v2.spiece.model`) originate
+from Google LLC and are distributed here under the Apache License, Version 2.0
+(see the sibling `LICENSE` file). Original copyright headers are retained in the
+source files.
+
+Gemma model *weights* are additionally governed by the Google Gemma Terms of
+Use (https://ai.google.dev/gemma/terms). Those terms are not reproduced here;
+downstream users who obtain and load Gemma 3 weights through this codebase are
+responsible for reviewing and complying with the Gemma Terms of Use, including
+its Prohibited Use Policy. The base checkpoint is an explicit, user-supplied
+input to `train.py --policy vla` and is not distributed with this repository.

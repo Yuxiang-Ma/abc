@@ -1,9 +1,10 @@
-# ABC-DiT deployment
+# ABC deployment
 
-This is the real-robot deployment stack for the released ABC-DiT model. It
+This is the real-robot deployment stack for the released ABC policies. It
 supports local or remote inference, standard action chunking, RTC, recording,
-teleoperation, and replay-based testing. VLA deployment is intentionally not
-part of this release.
+teleoperation, and replay-based testing. Both the ABC-DiT and the Gemma/SigLIP
+VLA policies are servable; the server auto-detects which one a checkpoint is
+(see [VLA inference](#vla-inference)).
 
 Install the hardware/runtime dependencies on the robot workstation:
 
@@ -31,6 +32,24 @@ CUDA_VISIBLE_DEVICES=0 uv run deploy/serve_policy.py --policy.checkpoint-path=ca
 Then run the robot side with `--remote-host=<gpu-host>`. Add
 `--compress-images` when network bandwidth or latency is limited.
 
+## VLA inference
+
+The Gemma/SigLIP diffusion VLA is served through the same websocket protocol;
+`serve_policy.py` auto-detects the checkpoint type (`--policy-type` forces it):
+
+```bash
+uv run prepare.py --vla-pretrained
+
+CUDA_VISIBLE_DEVICES=0 uv run deploy/serve_policy.py \
+    --policy.checkpoint-path=cache/vla_abc130k_200000_v2.pt \
+    --policy.prompt='connect and route the hose'
+```
+
+V2 checkpoints embed `norm_stats` (pass `--policy.norm-stats-path` for the
+original release files) and inference needs a ~24 GB GPU. `deploy_policy.py` and
+`dagger.py` launch this server locally and forward the same `--policy-type`,
+`--dit-model.*`, `--clip.*` and `--vla-model.*` flags.
+
 Useful flags:
 
 - `--diffusion-steps`: Euler flow steps, default 10.
@@ -39,24 +58,28 @@ Useful flags:
 - `--no-record`: skip H5 recording (recording is on by default).
 - `--debug`: run cameras and inference without commanding followers.
 - `--fast-inference`: use the bf16/compiled inference path.
+- `--policy-type`: force `dit`/`vla` instead of auto-detecting.
+- `--model-size`: model name stamped into recordings; defaults to `dit_xL` or `vla_4b` by detected policy type.
 - `--verbose`: show output from all child processes.
 
 ### Episode control
 
 Rollouts are episodic: the loop idles until you press a key, runs the policy,
-and on the next press stops, sends the robot home, and idles again. Keys —
-from the terminal keyboard or a foot pedal (see below): `a`/`b` start or
-stop+home, `c`/`j` shut everything down. With recording on (the default) one
+and on the next press stops, sends the robot home, and idles again. Keys are
+read from the terminal keyboard: `a`/`b` start or stop+home, `c`/`j` shut
+everything down. With recording on (the default) one
 H5 plus a review MP4 is saved per episode; with `--no-record` the same keys
 drive the loop directly (`--no-episode-control` restores free-running
 inference).
 
 ## Foot pedal
 
-All key-driven flows (episode control above, data collection, DAgger) read
-keys from the terminal *and*, when present, directly from a USB foot pedal's
-evdev device — so the pedal works over SSH and regardless of window focus,
-and is grabbed exclusively so presses don't also type into your shell.
+`deploy_policy.py` is keyboard-only; it has no foot-pedal support and no
+`--foot-pedal-device` flag. The pedal remains available for data collection
+(`deploy/robot/scripts/run_data_record.py`) and DAgger (`dagger.py`), which
+read keys from the terminal *and*, when present, directly from a USB foot
+pedal's evdev device — so the pedal works over SSH and regardless of window
+focus, and is grabbed exclusively so presses don't also type into your shell.
 
 **One-time station setup** — the pedal's device node is `root:input`, so
 grant yourself access once:

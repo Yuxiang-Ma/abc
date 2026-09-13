@@ -19,21 +19,17 @@ from pathlib import Path
 
 import tyro
 
-from deploy.deploy_config import DeployConfig
-from deploy.policy import PolicyConfig
+from deploy.deploy_config import DEFAULT_PROMPT, MODEL_SIZES, DeployConfig
+from deploy.policy.selector import sniff_policy_kind
 from deploy.robot import launch
 from deploy.robot.config import get_i2rt_config
 from deploy.robot.key_listeners.key_listener_config import KeyListenerConfig
-from deploy.robot.key_listeners.pedal import resolve_foot_pedal_device
 from deploy.robot.launch import ProcessSpec
 from deploy.robot.recorders.inference_recorder_config import InferenceRecorderConfig
 from deploy.robot.specs import camera_specs, follower_specs
 from deploy.robot.tasks import get_data_dir, select_task, task_to_collection_name
-from deploy.serve_policy_config import Args as ServeArgs
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
-DEFAULT_PROMPT = "throw plastic bottles in bin"
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +37,7 @@ DEFAULT_PROMPT = "throw plastic bottles in bin"
 # ---------------------------------------------------------------------------
 
 
-def _server_specs(cfg: DeployConfig, checkpoint: PolicyConfig) -> list[ProcessSpec]:
+def _server_specs(cfg: DeployConfig) -> list[ProcessSpec]:
     if cfg.remote_host:
         print(
             f"[deploy_policy] Remote mode: policy server expected at "
@@ -58,10 +54,13 @@ def _server_specs(cfg: DeployConfig, checkpoint: PolicyConfig) -> list[ProcessSp
             )
         return []
 
-    if not checkpoint.checkpoint_path:
+    if not cfg.checkpoint_path:
         raise ValueError("--checkpoint-path is required for local deployment")
-    args = ServeArgs(policy=checkpoint, port=cfg.port)
-    return [ProcessSpec("policy_server", "deploy.serve_policy:main", {"args": args})]
+    return [
+        ProcessSpec(
+            "policy_server", "deploy.serve_policy:main", {"args": cfg.serve_args()}
+        )
+    ]
 
 
 def _recorder_spec(
@@ -71,7 +70,7 @@ def _recorder_spec(
         collection_name=cfg.collection_name,
         data_root_directory=cfg.data_root_directory,
         checkpoint_path=cfg.checkpoint_path or "",
-        model_size="dit_xL",
+        model_size=cfg.model_size,
         diffusion_steps=cfg.diffusion_steps,
         task_name=task_name,
         session_tag=session_tag,
@@ -93,9 +92,9 @@ def _recorder_spec(
 
 
 def _real_robot_specs(
-    cfg: DeployConfig, checkpoint: PolicyConfig, *, task_name: str, session_tag: str
+    cfg: DeployConfig, *, task_name: str, session_tag: str
 ) -> list[ProcessSpec]:
-    specs = _server_specs(cfg, checkpoint)
+    specs = _server_specs(cfg)
     profile = get_i2rt_config()
     if not cfg.debug:
         specs.extend(follower_specs(profile, quiet=not cfg.verbose))
@@ -106,7 +105,7 @@ def _real_robot_specs(
             "deploy.robot.gym.policy_rollout",
             {
                 "args": cfg.rollout_config(
-                    pedal_control=cfg.record,
+                    recorder_control=cfg.record,
                     direct_episode_keys=cfg.episode_control and not cfg.record,
                 )
             },
@@ -123,7 +122,6 @@ def _real_robot_specs(
                 "cfg": KeyListenerConfig(
                     name="KeyListener",
                     control_rate=60,
-                    input_device=resolve_foot_pedal_device(cfg.foot_pedal_device),
                 )
             },
             # Key events drive the recorder (--record) or the rollout's own
@@ -168,13 +166,18 @@ def _prepare_task(cfg: DeployConfig) -> tuple[str, str]:
     return task_name, cfg.session_tag.strip().replace(" ", "_")
 
 
+def _resolve_policy(cfg: DeployConfig) -> None:
+    """Detect the checkpoint kind here so the server and the recorder label agree."""
+    if cfg.policy_type == "auto" and Path(cfg.checkpoint_path).expanduser().is_file():
+        cfg.policy_type = sniff_policy_kind(cfg.checkpoint_path)
+    cfg.model_size = cfg.model_size or MODEL_SIZES.get(cfg.policy_type, "")
+
+
 def main(cfg: DeployConfig) -> int:
     _configure_process(cfg)
-    checkpoint = cfg.checkpoint()
+    _resolve_policy(cfg)
     task_name, session_tag = _prepare_task(cfg)
-    specs = _real_robot_specs(
-        cfg, checkpoint, task_name=task_name, session_tag=session_tag
-    )
+    specs = _real_robot_specs(cfg, task_name=task_name, session_tag=session_tag)
     return launch.launch(specs)
 
 

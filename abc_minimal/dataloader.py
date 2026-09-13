@@ -11,11 +11,10 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset, Sampler
 
-from abc_minimal.config import DiTConfig, PromptConfig
+from abc_minimal.config import DiTConfig, PromptConfig, VLAModelConfig
 from abc_minimal.dit import task_name_to_prompt
 from abc_minimal.operator import operator_label_for
 from abc_minimal.preprocess import augment_and_normalize, normalize, preset_for_backbone
-
 
 # --- data-parallel placement ---------------------------------------------------
 
@@ -81,7 +80,9 @@ def data_parallel_scope(cache_root: Path, rank, world, local_rank, local_world):
 
 # --- on-disk episode format ----------------------------------------------------
 
-def scan_episodes(data_dir, default_task_name, model_config: DiTConfig):
+def scan_episodes(
+    data_dir, default_task_name, model_config: DiTConfig | VLAModelConfig
+):
     """Return episode metadata needed for frame sampling and video splitting."""
     episodes = []
     row_width = model_config.state_dim + model_config.action_dim
@@ -110,9 +111,12 @@ def _episode_prompt(ep_dir, meta, task_name):
     None for the task_name derivation.
     """
     instruction = meta.get("instruction")
-    if isinstance(instruction, str) and instruction.strip():
-        if task_name_to_prompt(instruction) != task_name_to_prompt(task_name or ""):
-            return instruction.strip()
+    if (
+        isinstance(instruction, str)
+        and instruction.strip()
+        and task_name_to_prompt(instruction) != task_name_to_prompt(task_name or "")
+    ):
+        return instruction.strip()
 
     recorded = _randomization_prompt(ep_dir)
     if recorded is not None and task_name_to_prompt(recorded) != task_name_to_prompt(
@@ -144,7 +148,9 @@ def _randomization_prompt(ep_dir):
         return prompt.strip()
     return None
 
-def read_state_action_rows(ep_dir, start, end, model_config: DiTConfig):
+def read_state_action_rows(
+    ep_dir, start, end, model_config: DiTConfig | VLAModelConfig
+):
     row_width = model_config.state_dim + model_config.action_dim
     row_bytes = row_width * 8
     with open(ep_dir / "states_actions.bin", "rb") as f:
@@ -211,6 +217,7 @@ def decode_frame(ep_dir, idx, episode_length, source_cameras, camera_keys):
     deterministically alias one top eye to `top`, matching production export.
     """
     import hashlib
+
     from torchcodec.decoders import VideoDecoder
 
     video_path = ep_dir / "combined_camera-images-rgb.mp4"
@@ -256,9 +263,10 @@ class EpisodeDataset(Dataset):
         train,
         default_task_name,
         mask_state_ratio,
-        model_config: DiTConfig,
+        model_config: DiTConfig | VLAModelConfig,
         prompt_config: PromptConfig | None = None,
         operator_label_maps=None,
+        norm_preset="auto",
     ):
         self.episodes = scan_episodes(data_dir, default_task_name, model_config)
         if not self.episodes:
@@ -268,7 +276,16 @@ class EpisodeDataset(Dataset):
         self.norm_stats = norm_stats
         self.train = train
         self.mask_state_ratio = mask_state_ratio
-        self.norm_preset = preset_for_backbone(model_config.vision_backbone)
+        backbone = getattr(model_config, "backbone", None)
+        self.image_size = getattr(backbone, "image_size", 224)
+        # "auto" derives the image-normalization preset from the vision backbone
+        # (DiT path). The VLA path passes norm_preset=None so SigLIP owns image
+        # normalization and frames stay in raw [0, 1].
+        self.norm_preset = (
+            preset_for_backbone(model_config.vision_backbone)
+            if norm_preset == "auto"
+            else norm_preset
+        )
         # Prompt composition rules; dropouts only apply when train=True.
         self.prompt_config = prompt_config or PromptConfig()
         # {task_name: {operator_uuid: rank}} — empty dict = no operator conditioning.
@@ -306,6 +323,7 @@ class EpisodeDataset(Dataset):
             decode_frame(ep_dir, k, length, source_cameras, self.camera_keys),
             self.train,
             norm_preset=self.norm_preset,
+            image_size=self.image_size,
         )
         prompt = self.build_prompt(ep_dir, k, task_name, recorded_prompt)
         return {
@@ -422,17 +440,19 @@ def collate(samples, camera_keys):
 # --- loader construction -------------------------------------------------------
 
 def build_train_loader(config, components, norm_stats, data_scope, resume_step,
-                       operator_label_maps):
+                       model_config, operator_label_maps=None, norm_preset="auto"):
     """Build the train mixture and its step-keyed loader.
 
     Returns the loader plus the per-component datasets for logging."""
+    prompt_config = getattr(config, "prompt", None)
     train_components = [
         EpisodeDataset(Path(config.cache_root) / c.train_dir, norm_stats, train=True,
                        default_task_name=c.task_name,
                        mask_state_ratio=config.flow.mask_state_ratio,
-                       model_config=config.model,
-                       prompt_config=config.prompt,
-                       operator_label_maps=operator_label_maps)
+                       model_config=model_config,
+                       prompt_config=prompt_config,
+                       operator_label_maps=operator_label_maps,
+                       norm_preset=norm_preset)
         for c in components
     ]
     component_weights = [c.weight for c in components]
@@ -453,25 +473,28 @@ def build_train_loader(config, components, norm_stats, data_scope, resume_step,
         sampler=train_sampler,
         shuffle=False,
         num_workers=config.num_workers,
-        collate_fn=partial(collate, camera_keys=config.model.camera_keys),
+        collate_fn=partial(collate, camera_keys=model_config.camera_keys),
         pin_memory=True,
         drop_last=True,
         persistent_workers=config.num_workers > 0,
     )
     return train_loader, train_components
 
-def build_val_loaders(config, components, norm_stats, data_scope, operator_label_maps):
+def build_val_loaders(config, components, norm_stats, data_scope, model_config,
+                      operator_label_maps=None, norm_preset="auto"):
     """Build per-component val loaders striding this rank's slice.
 
     Returns the loaders plus (name, dataset) pairs for logging."""
+    prompt_config = getattr(config, "prompt", None)
     val_components = [
         (c.val_dir, EpisodeDataset(Path(config.cache_root) / c.val_dir, norm_stats,
                                    train=False,
                                    default_task_name=c.task_name,
                                    mask_state_ratio=config.flow.mask_state_ratio,
-                                   model_config=config.model,
-                                   prompt_config=config.prompt,
-                                   operator_label_maps=operator_label_maps))
+                                   model_config=model_config,
+                                   prompt_config=prompt_config,
+                                   operator_label_maps=operator_label_maps,
+                                   norm_preset=norm_preset))
         for c in components
     ]
     val_loaders = {}
@@ -497,7 +520,7 @@ def build_val_loaders(config, components, norm_stats, data_scope, operator_label
             batch_size=config.batch_size,
             shuffle=False,
             num_workers=2,
-            collate_fn=partial(collate, camera_keys=config.model.camera_keys),
+            collate_fn=partial(collate, camera_keys=model_config.camera_keys),
             drop_last=True,
         )
     return val_loaders, val_components

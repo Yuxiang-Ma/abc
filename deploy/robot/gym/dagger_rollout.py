@@ -199,9 +199,7 @@ class DaggerLoop:
                 api_key=None,
                 compress_images=args.compress_images,
             )
-            self.rtc_manager = RTCInferenceManager(
-                self.policy, args.prefix_length, args.inference_lead_steps
-            )
+            self.rtc_manager = RTCInferenceManager(self.policy, args.prefix_length)
         else:
             self.policy = websocket_client_policy.WebsocketClientPolicy(
                 host=args.host,
@@ -309,7 +307,6 @@ class DaggerLoop:
             prefix = self._rtc_prefix()
             obs["action_prefix"] = prefix
             obs["prefix_length"] = self.args.prefix_length
-            obs["latency"] = self.args.inference_lead_steps - self.args.prefix_length
         start = time.perf_counter()
         result = self.policy.infer(obs)
         end = time.perf_counter()

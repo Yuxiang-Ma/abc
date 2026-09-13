@@ -1,9 +1,25 @@
+import getpass
 import json
+import os
 import struct
 import time
 
 import numpy as np
 import zmq
+
+
+# Per-user IPC socket directory. libzmq silently unlinks and rebinds a
+# leftover socket file it owns, so same-user crashes self-heal -- but with a
+# shared namespace like /tmp/<topic>, a crashed run by ANOTHER user leaves
+# files that unlink() cannot remove (sticky /tmp), so bind() fails with
+# EADDRINUSE until someone with privileges cleans up. A per-user dir makes
+# users independent.
+_IPC_DIR = f"/tmp/abc-{getpass.getuser()}"
+
+
+def _ipc_path(topic: str) -> str:
+    os.makedirs(_IPC_DIR, mode=0o700, exist_ok=True)
+    return f"{_IPC_DIR}/{topic}"
 
 
 def create_publisher(
@@ -18,7 +34,7 @@ def create_publisher(
     if send_timeout is not None:
         publisher.setsockopt(zmq.SNDTIMEO, send_timeout)
     if "://" not in topic:
-        publisher.bind(f"ipc:///tmp/{topic}")
+        publisher.bind(f"ipc://{_ipc_path(topic)}")
     else:
         publisher.bind(topic)
     return publisher
@@ -49,7 +65,7 @@ def create_subscriber(
         subscriber.setsockopt(zmq.CONFLATE, conflate)
     subscriber.setsockopt_string(zmq.SUBSCRIBE, "")
     if "://" not in topic:
-        subscriber.connect(f"ipc:///tmp/{topic}")
+        subscriber.connect(f"ipc://{_ipc_path(topic)}")
     else:
         subscriber.connect(topic)
     return subscriber

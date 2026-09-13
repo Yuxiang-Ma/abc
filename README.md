@@ -13,6 +13,10 @@
 
 Code for the ABC project.
 
+> Note: we have released a minimal ABC-DiT training and real-robot deployment
+> pipeline, data conversion and simulation tools, and the focused diffusion VLA
+> implementation documented below.
+
 ## Release Roadmap
 - [x] June 17 -- Release Minimal Training Pipeline
 - [ ] Sep 1 -- Release all sim data  (sorry for the delay!)
@@ -28,7 +32,7 @@ This README is a quickstart for local training — the package READMEs above hol
 | [`abc_sim/`](abc_sim/README.md) | self-contained simulator: MuJoCo scenes, task catalogue, randomization, evaluators, Gym API, sim eval |
 | [`deploy/`](deploy/README.md) | real-robot deployment: local/remote inference, RTC, teleop, DAgger, recording |
 
-`train.py`, `eval_policy.py`, `viz_episode.py`, `viz_policy.py`, and `prepare.py` at the root are the entrypoints; `scripts/` holds the data conversion utilities. 
+`train.py`, `eval_policy.py`, `viz_episode.py`, `viz_policy.py`, and `prepare.py` at the root are the entrypoints; `scripts/` holds the data conversion utilities.
 
 ## Setup
 
@@ -49,7 +53,7 @@ uv python pin 3.12
 uv sync
 ```
 
-## Training an ABC-DiT
+## Training
 
 First we need to download the requisite data (norm stats and either a sample or full data.)
 ```bash
@@ -75,6 +79,8 @@ outside the repository.
 
 :warning: Note: `prepare.py` does not download DINO weights. Review and follow the DINO license terms, then download the weights from [Meta](https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/) or [Hugging Face](https://huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m). Save the file as `dinov3_vitb16_pretrain_lvd1689m.pth` in the cache dir. :warning:
 
+### ABC-DiT Training
+
 The command to run training is below. Note that this is for single node training with 8 GPUs, change `nproc-per-node` if you want.
 
 ```bash
@@ -91,7 +97,34 @@ Training defaults in `abc_minimal/config.py` match the production reference fine
 
 If you have fewer GPUs than 8 you need to reduce nproc per node or if you have less than 80Gb of VRAM you may need to reduce `--batch-size`.  The above training yields ~2.6-3 iterations / sec on H100/H200. It achieves a training loss of ~`0.048` after 75k steps.  The DiT policy also supports a CLIP ViT-B/16 vision backbone (in place of DINOv3) via `--model.vision-backbone clip`.
 
-To finetune from a released checkpoint instead of training from scratch, download the parent and pass `--load-pretrained` (fresh optimizer, step 0):
+### ABC-VLA Training
+
+A diffusion-only port of the Gemma 3 VLA: Gemma 3 4B with SigLIP at 224x224, one
+selectable Gemma feature layer, QK-normalized learned-query pooling, a state token
+plus optional direct state conditioning, and a small AdaLN DiT head. FAST tokens,
+the alternative conditioners, and the FSDP stack are not included.
+
+Training from the Gemma base needs Google's `gemma_pytorch` checkpoint
+(`google/gemma-3/pyTorch/gemma-3-4b-pt` on Kaggle, under the Gemma Terms of Use);
+the Hugging Face format is not compatible. Select the policy with `--policy vla`:
+
+```bash
+uv run torchrun --standalone --nproc-per-node 8 train.py \
+    --policy vla \
+    --vla-model.backbone.checkpoint /path/to/gemma3_4b_pt.pt \
+    --flow.num-diffusion-draws 4
+```
+
+The `--prompt.*` subtask and operator options apply to the VLA as to the DiT;
+neither has been validated for it. `--fsdp` shards parameters, gradients, and
+Adam state across the ranks instead of replicating them, roughly halving
+per-GPU memory on two GPUs.
+
+### Finetuning from a released checkpoint
+
+To finetune from a released checkpoint instead of training from scratch, download the parent and pass `--load-pretrained` (fresh optimizer, step 0).
+
+#### ABC-DiT Finetuning
 
 ```bash
 # Pulls cache/abc_dit_xl_200k_model.pt (~8.1 GB)
@@ -99,7 +132,31 @@ uv run prepare.py --pretrained
 uv run train.py --load-pretrained
 ```
 
-`--pretrained-ckpt-name` picks the checkpoint file inside the cache dir (default`abc_dit_xl_200k_model.pt`, which is what `--pretrained` downloads). (Use with `--model.vision-backbone clip`when the parent is a CLIP-DiT checkpoint, as DiNO is the default). 
+`--pretrained-ckpt-name` picks the checkpoint file inside the cache dir (default
+`abc_dit_xl_200k_model.pt`, which is what `--pretrained` downloads). Use
+`--model.vision-backbone clip` when the parent is a CLIP-DiT checkpoint; DINOv3
+is the default.
+
+#### ABC-VLA Finetuning
+
+The same weights-only path works for VLA checkpoints and needs no Gemma base:
+
+```bash
+uv run prepare.py --vla-pretrained
+
+uv run train.py \
+    --policy vla \
+    --load-pretrained \
+    --pretrained-ckpt-name vla_abc130k_200000_v2.pt
+```
+
+`--vla-pretrained` fetches the recommended `abc130k` step-200000 parent, verifies
+its checksum, and installs the assets for its five sim tasks;
+`--vla-pretrained-family {abc130k,200k}` and `--vla-pretrained-step
+{50000,100000,200000}` select the others (the `200k` family trained on xdof only).
+The v2 files embed norm stats and architecture metadata, which is checked against
+the CLI config before strict loading; `--resume-from` is only for a stateful
+continuation.
 
 **Multi-node training, the episode data format, and prompt conditioning options
 are documented in the [abc_minimal README](abc_minimal/README.md).**
@@ -119,46 +176,41 @@ The replay modes (pose playback vs physics re-simulation) are described in the
 
 ## Evaluation
 
-`eval_policy.py` evaluates a checkpoint on the `abc_sim/` task catalogue — one
-you trained yourself (drops into `cache/finetune_checkpoints/last.pt`) or any
-of the released ones:
+`eval_policy.py` evaluates a checkpoint on the `abc_sim/` task catalogue: one
+you trained yourself (`cache/finetune_checkpoints/last.pt`) or a released one:
 
 ```bash
-# bottles_75k.pt (~8.1 GB): the 75k-step bottles-only policy, pulled
-# alongside norm_stats.json and the preview tar.
+# bottles_75k.pt: the 75k-step bottles-only policy, with norm_stats.json and the preview tar.
 uv run prepare.py --checkpoint
 
-# abc_dit_xl_200k_model.pt (~8.1 GB) + its prompt sidecar: the multi-task
-# sim policy, which is also the --load-pretrained finetuning parent.
+# abc_dit_xl_200k_model.pt: the multi-task DiT parent.
 uv run prepare.py --pretrained
 
-# Per-task finetunes of that parent (~8 GB each: model-only; add
-# --sim-checkpoint-full-state for the ~24 GB training-state file), one per sim
-# task, resolved through the checkpoint manifest — downloads the task's
-# recommended step (not always 25k), sha256-verifies, and prints the
-# matching eval command. --sim-checkpoint-list shows the catalogue + results.
+# vla_abc130k_200000_v2.pt: the VLA parent, with its five tasks' assets.
+uv run prepare.py --vla-pretrained
+
+# A per-task finetune at its recommended step, sha-verified, with its eval command
+# printed. --sim-checkpoint-list shows the catalogue with results;
+# --sim-checkpoint-full-state fetches the ~24 GB training-state file instead.
 uv run prepare.py --sim-checkpoint pour
 ```
 
-The pretrained download installs assets for every supported sim task, then
-prints the task names followed by compact eval and viewer command templates.
-Evaluation and viewing both read the checkpoint sidecar and automatically use
-the exact prompt that task trained under.
+Every download installs the sim assets its checkpoint needs and prints eval and
+viewer commands. Both tools use the prompt each checkpoint trained under, so
+`--sim.prompt` and `--sim.checkpoint` are only for overrides.
 
-To watch a released finetuned policy live in a viser window at
-`localhost:8080`, prepare the task bundle once, then select the task in the
-viewer. A bundle contains the task's sim assets and recommended checkpoint
-(~8 GB model-only, sha-verified), but not its episode data:
+To watch a policy live in a viser window at `localhost:8080`, prepare its task
+bundle once (the assets plus the recommended model-only checkpoint, no episode
+data), then select the task in the viewer. Every task has a DiT bundle and a
+`vla_` bundle; `--sim-bundle-list` shows all of them with their results, and
+`--sim-force` refreshes a cached manifest:
 
 ```bash
 uv run prepare.py --sim-bundle-list
 uv run prepare.py --sim-bundle put_plastic_bottles_in_bin
+uv run prepare.py --sim-bundle vla_lego_blocks_sorting
 uv run viz_policy.py --sim.task put_plastic_bottles_in_bin --port 8080
 ```
-
-The viewer resolves the locally cached recommended checkpoint and its published
-training prompt from the checkpoint manifest. Pass `--sim.checkpoint` or
-`--sim.prompt` only to override those defaults.
 
 ![](assets/sim_eval.gif)
 
@@ -190,7 +242,7 @@ documented in the [abc_sim README](abc_sim/README.md#sim-eval).
 
 ## Real-robot deployment
 
-The DiT-only deployment stack, including RTC, teleoperation, and recording, is
+The deployment stack, including RTC, teleoperation, and recording, is
 documented in [`deploy/README.md`](deploy/README.md). Install its optional
 hardware dependencies with `uv sync --extra deploy`.
 
@@ -227,6 +279,17 @@ cases. Bundled license texts live under `assets/third_party/`.
 | [OpenAI CLIP](https://github.com/openai/CLIP) | MIT | [`assets/third_party/clip/LICENSE`](assets/third_party/clip/LICENSE) | Adapted (`abc_minimal/dit.py`); ViT-B/32 text weights + BPE vocab downloaded at runtime | CLIP text encoder + BPE tokenizer (`CLIPBPETokenizer`, `CLIPTextTower`, `CLIPTextEmbedder`) |
 | [openpi](https://github.com/Physical-Intelligence/openpi) | Apache 2.0 | [`assets/third_party/openpi/LICENSE`](assets/third_party/openpi/LICENSE) | Adapted (`deploy/client/websocket_client_policy.py`, `deploy/client/msgpack_numpy.py`) | Websocket inference client skeleton + msgpack NumPy serialization |
 | [msgpack-numpy](https://github.com/lebedov/msgpack-numpy) | BSD 3-Clause | [`assets/third_party/msgpack_numpy/LICENSE.md`](assets/third_party/msgpack_numpy/LICENSE.md) | Adapted (`deploy/client/msgpack_numpy.py`, via openpi) | NumPy serialization strategy for msgpack |
+| [Gemma](https://ai.google.dev/gemma) | Apache 2.0 (code); Gemma Terms of Use (weights) | [`assets/third_party/gemma/LICENSE`](assets/third_party/gemma/LICENSE) | Adapted (`abc_minimal/gemma/`); base checkpoint supplied by the user | Gemma 3 model + SentencePiece tokenizer for the diffusion VLA |
+| [SigLIP](https://github.com/google-research/big_vision) | Apache 2.0 | [`assets/third_party/gemma/LICENSE`](assets/third_party/gemma/LICENSE) | Adapted (`abc_minimal/gemma/siglip_vision/`) | SigLIP vision encoder for the diffusion VLA |
+
+### Gemma weights terms of use
+
+Gemma model code is Apache-2.0, but Gemma *weights* are additionally governed by
+the Google Gemma Terms of Use (https://ai.google.dev/gemma/terms), including its
+Prohibited Use Policy. The base Gemma 3 checkpoint is an explicit, user-supplied
+input to `train.py --policy vla` and is not distributed with this repository; downstream
+users who obtain and load Gemma weights through this codebase are responsible for
+complying with those terms. See `assets/third_party/gemma/NOTICE` for details.
 
 ### Simulator asset licenses
 
@@ -248,7 +311,6 @@ packages where noted.
 | [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) | MIT | The `short_cabinet` drawer fixture in `task_multi_drawer_search`; license copy in the package |
 | [i2rt YAM](https://github.com/i2rt-robotics) | MIT | The `i2rt_yam` robot model package; license copy in the package |
 | This project | Apache-2.0 | Everything else, modeled or scanned in-house: `ball_sorting_toy`, `brush`, `brush_flat`, `building_blocks`, `chess`, `cup_stacking`, `dishrack`, `drawer`, `flexible_gripper`, `hand_brush_smooth`, `jenga`, `letters`, `marker`, `mug_tree`, `new_brush`, `plate`, the generated `task_nuts_bolts` meshes, the conveyor fixture in `task_conveyor_pick`, the baked plate/rack originals in `task_dishrack`, `tin_2` in `task_chess`, and all task-tuned MJCF wrappers and collision meshes |
-
 
 ### DINOv3 use restrictions
 
