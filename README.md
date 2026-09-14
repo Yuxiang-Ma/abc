@@ -13,10 +13,6 @@
 
 Code for the ABC project.
 
-> Note: we have released a minimal ABC-DiT training and real-robot deployment
-> pipeline, data conversion and simulation tools, and the focused ABC-VLA
-> implementation documented below.
-
 ## Release status
 
 This release includes ABC-DiT and ABC-VLA training, pretrained and
@@ -34,6 +30,7 @@ This README covers setup, a short evaluation smoke test, and training. The packa
 | [`abc_minimal/`](abc_minimal/README.md) | ABC models, dataloader, training loop, policy inference, episode tools |
 | [`abc_sim/`](abc_sim/README.md) | self-contained simulator: MuJoCo scenes, task catalogue, randomization, evaluators, Gym API, sim eval |
 | [`deploy/`](deploy/README.md) | real-robot deployment: local/remote inference, RTC, teleop, DAgger, recording |
+| [GELLO hardware](deploy/gello/README.md) | printable parts, bill of materials, and assembly guide |
 
 `train.py`, `eval_policy.py`, `viz_episode.py`, `viz_policy.py`, and `prepare.py` at the root are the entrypoints; `scripts/` holds the data conversion utilities.
 
