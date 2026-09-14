@@ -170,6 +170,8 @@ class TrainConfig:
     vla_bf16_autocast: bool = True
     # VLA only: shard parameters, gradients, and Adam state across the ranks (FSDP2)
     # instead of replicating them (DDP). Needs torchrun with more than one process.
+    # Multi-node automatically uses HSDP (shard within node over NVLink, replicate
+    # across nodes); single node uses flat full FSDP. See train_loop._shard_vla.
     fsdp: bool = False
     compile: bool = True
     # VLA policy only: torch.compile the SigLIP tower (the Gemma stack is not

@@ -120,8 +120,11 @@ def warn_bf16_rounding(groups, rank):
         )
 
 
-def _shard_vla(model, world):
-    """FSDP2: every transformer block is its own shard group; the root holds the rest."""
+def _shard_vla(model, world, local_world):
+    """FSDP2: every transformer block is its own shard group; the root holds the rest.
+
+    Multi-node uses HSDP (shard in-node, replicate across); single node flat FSDP.
+    """
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import fully_shard
 
@@ -129,7 +132,15 @@ def _shard_vla(model, world):
     for tensor in (*model.parameters(), *model.buffers()):
         dist.broadcast(tensor.detach(), src=0)
 
-    mesh = init_device_mesh("cuda", (world,))
+    n_nodes = world // local_world if local_world else 1
+    if n_nodes > 1 and n_nodes * local_world == world:
+        # HSDP: shard within node (NVLink), replicate across nodes.
+        mesh = init_device_mesh(
+            "cuda", (n_nodes, local_world), mesh_dim_names=("replicate", "shard")
+        )
+    else:
+        # Full FSDP: shard across the whole world (single node, or ragged layout).
+        mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("shard",))
     gemma = model.vla.gemma_model
     for block in (
         *gemma.model.layers,
@@ -335,7 +346,7 @@ def main(config: TrainConfig):
     if fsdp:
         if not distributed:
             raise ValueError("--fsdp shards across ranks; launch with torchrun --nproc-per-node > 1")
-        _shard_vla(model, world)
+        _shard_vla(model, world, local_world)
     optimizer = _build_optimizer(model, config, is_vla, rank)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda step: min((step + 1) / config.optim.lr_warmup_steps, 1.0)
