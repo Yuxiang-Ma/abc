@@ -50,6 +50,8 @@ deploy = [
 dev = ["ruff"]
 
 [tool.uv]
+# Ruckig 0.15.3 still uses the scikit-build-core pre-0.10 CMake target setting.
+build-constraint-dependencies = ["scikit-build-core<0.10"]
 override-dependencies = [
     "mujoco~=3.8.0",
     "tyro>=1.0.5",
