@@ -156,6 +156,16 @@ _CBOX_CAN = (
 
 
 PROFILES = {
+    # React tactile world-model station (2026-09-22): two YAM arms on CANable 2.5 adapters.
+    # Left/right assignment of the two CAN serials is provisional -- swap if the wrong arm answers.
+    # Cameras: none connected yet; serials are placeholders so camera nodes are simply not launched.
+    "react_yam_config": _profile(
+        camera_serials=("000000000000", "000000000001", "000000000002"),
+        leader_devices=("/dev/ttyUSB0", "/dev/ttyUSB1"),
+        init_q=_DEFAULT_INIT_Q,
+        can_serials=("", "2065376445465009", "", "2097378145465006"),
+        gripper_type="no_gripper",   # gripper motors disconnected; the GelSight is the end effector
+    ),
     "bbox_config": _profile(
         camera_serials=("335122272485", "352122272888", "218622274707"),
         leader_devices=("/dev/ttyUSB0", "/dev/ttyUSB1"),

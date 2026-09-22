@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Literal
 
-GripperType = Literal["crank_4310", "linear_3507", "linear_4310", "flexible_4310"]
+GripperType = Literal["crank_4310", "linear_3507", "linear_4310", "flexible_4310", "no_gripper"]
 
 
 @dataclass

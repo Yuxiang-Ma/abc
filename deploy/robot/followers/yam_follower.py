@@ -119,7 +119,16 @@ class YAMFollowerNode(Node):
         self.robot_obs_topic_name = f"{self._name}_obs"
         self.create_publisher(self.robot_obs_topic_name)
 
+    @property
+    def _dof(self) -> int:
+        return 6 if self.gripper_type == "no_gripper" else 7
+
+    def _to_motor_space(self, command: np.ndarray) -> np.ndarray:
+        """Wire format is always 7 per arm; without a gripper motor the 7th value is dropped."""
+        return np.asarray(command, dtype=float).reshape(-1)[: self._dof]
+
     def process_command(self, command: np.ndarray, extras: dict) -> None:
+        command = self._to_motor_space(command)
         if extras.get("type", "servo") == "interp":
             current_pos = self.get_joint_pos()
             steps = 50
@@ -136,11 +145,19 @@ class YAMFollowerNode(Node):
         self.robot.command_joint_pos(joint_pos)
 
     def get_joint_pos(self) -> np.ndarray:
-        return self.robot.get_joint_pos()
+        q = np.asarray(self.robot.get_joint_pos(), dtype=float).reshape(-1)
+        if self._dof == 6:            # keep the 7-wide wire format: gripper slot reads 0 (closed)
+            q = np.concatenate([q, [0.0]])
+        return q
 
     def get_robot_obs(self) -> np.ndarray:
         obs = self.robot.get_observations()
         joint_pos = np.asarray(obs["joint_pos"]).reshape(-1)
+        if self._dof == 6:            # no gripper motor: synthesise the gripper slots so consumers see 7
+            obs = dict(obs)
+            obs["gripper_pos"] = np.zeros(1)
+            obs["joint_vel"] = np.concatenate([np.asarray(obs["joint_vel"]).reshape(-1), [0.0]])
+            obs["joint_eff"] = np.concatenate([np.asarray(obs["joint_eff"]).reshape(-1), [0.0]])
         gripper_pos = np.asarray(obs["gripper_pos"]).reshape(-1)
 
         # Support both i2rt observation layouts.
@@ -183,6 +200,7 @@ class YAMFollowerNode(Node):
         "linear_3507": "LINEAR_3507",
         "linear_4310": "LINEAR_4310",
         "flexible_4310": "FLEXIBLE_4310",
+        "no_gripper": "NO_GRIPPER",   # gripper motor physically absent: 6 motors on the bus
     }
 
     def initial_bootup(self) -> None:
@@ -231,8 +249,9 @@ class YAMFollowerNode(Node):
         if not hasattr(self, "robot"):
             return
         try:
-            q_des = np.zeros(7)
-            q_des[6] = self.get_joint_pos()[-1]
+            q_des = np.zeros(self._dof)
+            if self._dof == 7:
+                q_des[6] = self.get_joint_pos()[-1]
             try:
                 self.robot.move_joints(q_des, 2.0)
             except Exception:
