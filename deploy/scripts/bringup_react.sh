@@ -5,7 +5,7 @@
 set -e
 cd "$(dirname "$0")/../.."
 export ROBOT_PROFILE=${ROBOT_PROFILE:-react_yam_config}
-L_SERIAL=2065376445465009; R_SERIAL=2097378145465006
+L_SERIAL=2097378145465006; R_SERIAL=2065376445465009   # verified 2026-09-23: left arm = ...006
 RULE=/etc/udev/rules.d/90-react-yam-can.rules
 
 if [ "$1" = "install-udev" ]; then
